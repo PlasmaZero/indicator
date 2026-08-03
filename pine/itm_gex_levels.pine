@@ -69,7 +69,16 @@ i_swing   = input.int(10, "Sweep lookback", minval = 3, group = G_SIG, inline = 
 // ── Targets & risk ───────────────────────────────────────────────────────────
 i_minRR    = input.float(1.3, "Min reward:risk", minval = 0.2, step = 0.1, group = G_RISK)
 i_stopATR  = input.float(1.1, "Stop (ATR mult)", minval = 0.2, step = 0.1, group = G_RISK)
+i_maxRiskATR = input.float(1.8, "Max risk (ATR mult)", minval = 0.3, step = 0.1, group = G_RISK,
+     tooltip = "Caps the stop distance so a far-away structural level can't create an oversized loss.")
+i_manageOn = input.bool(true, "Track trades on chart", group = G_RISK)
+i_beAtTp1  = input.bool(true, "Move stop to breakeven at TP1", group = G_RISK)
+i_exitEOD  = input.bool(true, "Flatten at session close (0DTE)", group = G_RISK)
+i_exitFlip = input.bool(false, "Exit if score flips against the trade", group = G_RISK)
+i_pinGuard = input.bool(true, "Block new entries pinned to the control node", group = G_RISK,
+     tooltip = "Late in the session in positive gamma, price parked on the control node tends to stay there. Suppresses low-quality entries.")
 i_drawProj = input.bool(true, "Draw target projection", group = G_RISK)
+i_showStats = input.bool(true, "Session stats table", group = G_RISK)
 
 // ── Display ──────────────────────────────────────────────────────────────────
 i_back = input.int(60, "Ray look-back bars", minval = 0, maxval = 500, group = G_UI)
@@ -83,10 +92,20 @@ c_node = input.color(#ffd54a, "Control node",     group = G_UI, inline = "c2")
 // =============================================================================
 //  Blob parsing
 // =============================================================================
+// Pasting from a terminal drags in newlines, and text_area keeps them. A stray
+// newline on the front would silently break the first key, so strip all
+// whitespace before parsing.
+f_clean(string s) =>
+    t = str.replace_all(s, " ", "")
+    t := str.replace_all(t, "\n", "")
+    t := str.replace_all(t, "\r", "")
+    t := str.replace_all(t, "\t", "")
+    t
+
 f_key(string blob, string key) =>
     float out = na
     if str.length(blob) > 0
-        parts = str.split(str.replace_all(blob, " ", ""), ",")
+        parts = str.split(f_clean(blob), ",")
         for i = 0 to array.size(parts) - 1
             kv = str.split(array.get(parts, i), ":")
             if array.size(kv) == 2 and array.get(kv, 0) == key
@@ -110,7 +129,7 @@ var float[] pGex    = array.new<float>()
 var float   pMaxAbs = 0.0
 
 if barstate.isfirst and str.length(i_prof) > 0
-    rows = str.split(str.replace_all(i_prof, " ", ""), ",")
+    rows = str.split(f_clean(i_prof), ",")
     for i = 0 to math.min(array.size(rows), i_profMax) - 1
         kv = str.split(array.get(rows, i), "=")
         if array.size(kv) == 2
@@ -183,6 +202,14 @@ cwLvl   = hasGex ? gexCW   : (i_autoOn ? math.max(nz(pdh, dHi), dHi) : na)
 pwLvl   = hasGex ? gexPW   : (i_autoOn ? math.min(nz(pdl, dLo), dLo) : na)
 cnLvl   = hasGex ? gexCN   : (i_autoOn ? poc : na)
 
+// Expected-move envelope around the session open — also a target candidate,
+// so it has to exist before the trade logic below.
+var float sessOpen = na
+if newDay
+    sessOpen := open
+emUp = na(gexEM) or na(sessOpen) ? na : sessOpen + gexEM
+emDn = na(gexEM) or na(sessOpen) ? na : sessOpen - gexEM
+
 // =============================================================================
 //  Regime
 // =============================================================================
@@ -191,7 +218,13 @@ cnLvl   = hasGex ? gexCN   : (i_autoOn ? poc : na)
 // Below it they are short gamma: hedging amplifies moves and trends extend.
 posGamma = not na(flipLvl) and close > flipLvl
 negGamma = not na(flipLvl) and close < flipLvl
-regime   = posGamma ? "POSITIVE γ · mean-revert / pin" : negGamma ? "NEGATIVE γ · trend / expand" : "NO GEX · price-only"
+// Without a blob the "flip" is only VWAP, so the bias is a mean-reversion proxy
+// and must not be reported as a gamma regime — there is no options data behind it.
+regime = not hasGex
+     ? (na(flipLvl) ? "NO DATA · price-only"
+        : posGamma ? "AUTO · above VWAP (no GEX)" : "AUTO · below VWAP (no GEX)")
+     : posGamma ? "POSITIVE γ · mean-revert / pin"
+     : negGamma ? "NEGATIVE γ · trend / expand" : "NO GEX · price-only"
 
 // =============================================================================
 //  Signal components  (each returns roughly -1 … +1)
@@ -292,11 +325,80 @@ sessionOk = not i_rthOnly or inRth
 openOk    = inRth ? rthBar > i_skipOpen : not i_rthOnly
 eodOk     = inRth ? rthBar <= rthTotal - i_skipEOD : not i_rthOnly
 
-// Targets: next level in the trade's direction
-longTgt  = na(resLvl) ? close + atr * 2.0 : resLvl
-shortTgt = na(supLvl) ? close - atr * 2.0 : supLvl
-longStop  = math.min(ta.lowest(low, 5), close - atr * i_stopATR)
-shortStop = math.max(ta.highest(high, 5), close + atr * i_stopATR)
+// ── Trade construction ───────────────────────────────────────────────────────
+// Targets are real GEX levels, not ATR guesses: price tends to travel between
+// walls and stall at them, so the levels themselves are the natural exits.
+f_levelPool() =>
+    arr = array.new<float>()
+    if not na(cwLvl)
+        array.push(arr, cwLvl)
+    if not na(gexCW2)
+        array.push(arr, gexCW2)
+    if not na(pwLvl)
+        array.push(arr, pwLvl)
+    if not na(gexPW2)
+        array.push(arr, gexPW2)
+    if not na(cnLvl)
+        array.push(arr, cnLvl)
+    if not na(flipLvl)
+        array.push(arr, flipLvl)
+    if not na(emUp)
+        array.push(arr, emUp)
+    if not na(emDn)
+        array.push(arr, emDn)
+    if not hasGex
+        // auto mode: fall back to structural levels so targets still exist
+        if not na(pdh)
+            array.push(arr, pdh)
+        if not na(pdl)
+            array.push(arr, pdl)
+        if not na(onh)
+            array.push(arr, onh)
+        if not na(onl)
+            array.push(arr, onl)
+    array.sort(arr, order.ascending)
+    arr
+
+// The nth level beyond `px` in the trade's direction, ignoring anything closer
+// than minGap so TP1 is never a few ticks away.
+f_targetN(float px, bool up, int n, float minGap) =>
+    pool = f_levelPool()
+    float out = na
+    int found = 0
+    if array.size(pool) > 0
+        if up
+            for i = 0 to array.size(pool) - 1
+                v = array.get(pool, i)
+                if v > px + minGap and na(out)
+                    found += 1
+                    if found == n
+                        out := v
+        else
+            for i = array.size(pool) - 1 to 0
+                v = array.get(pool, i)
+                if v < px - minGap and na(out)
+                    found += 1
+                    if found == n
+                        out := v
+    out
+
+minGap = atr * 0.35
+longTp1  = f_targetN(close, true,  1, minGap)
+longTp2  = f_targetN(close, true,  2, minGap)
+shortTp1 = f_targetN(close, false, 1, minGap)
+shortTp2 = f_targetN(close, false, 2, minGap)
+
+// No level in range — fall back to a measured move so a trade is still definable.
+longTgt  = na(longTp1)  ? close + atr * 2.0 : longTp1
+shortTgt = na(shortTp1) ? close - atr * 2.0 : shortTp1
+
+// Stop sits beyond structure, then risk is capped so a distant level can't
+// create an oversized loss.
+rawLongStop  = math.min(ta.lowest(low, 5), close - atr * i_stopATR)
+rawShortStop = math.max(ta.highest(high, 5), close + atr * i_stopATR)
+longStop  = math.max(rawLongStop,  close - atr * i_maxRiskATR)
+shortStop = math.min(rawShortStop, close + atr * i_maxRiskATR)
+
 longRR  = (close - longStop)  > 0 ? (longTgt - close)  / (close - longStop)  : 0.0
 shortRR = (shortStop - close) > 0 ? (close - shortTgt) / (shortStop - close) : 0.0
 
@@ -304,14 +406,105 @@ shortRR = (shortStop - close) > 0 ? (close - shortTgt) / (shortStop - close) : 0
 blockLong  = i_regimeF and posGamma and not na(dRes) and dRes < 0.4
 blockShort = i_regimeF and posGamma and not na(dSup) and dSup < 0.4
 
+// 0DTE pin: in positive gamma, late session, parked on the control node, price
+// usually stays there. Those entries pay the spread and go nowhere.
+lateSession = inRth and rthBar > rthTotal * 0.6
+pinned = i_pinGuard and posGamma and hasGex and lateSession
+     and not na(cnLvl) and atr > 0 and math.abs(close - cnLvl) < atr * 0.35
+
 var int lastSig = -1000
-canFire = i_sigOn and sessionOk and openOk and eodOk and barstate.isconfirmed and (bar_index - lastSig) > i_cooldown
+canFire = i_sigOn and sessionOk and openOk and eodOk and barstate.isconfirmed
+     and (bar_index - lastSig) > i_cooldown and not pinned
 
 buySig  = canFire and score >=  i_thresh and longRR  >= i_minRR and not blockLong
 sellSig = canFire and score <= -i_thresh and shortRR >= i_minRR and not blockShort
 
 if buySig or sellSig
     lastSig := bar_index
+
+// =============================================================================
+//  Trade manager — entry, stop, targets, exit
+// =============================================================================
+var int   tDir    = 0        // 0 flat, 1 long, -1 short
+var float tEntry  = na
+var float tStop   = na
+var float tTp1    = na
+var float tTp2    = na
+var float tRisk   = na       // initial risk per unit, for R multiples
+var int   tBar    = na
+var bool  tTp1Hit = false
+
+var int   nWin = 0
+var int   nLoss = 0
+var float sumR = 0.0
+if newDay
+    nWin := 0
+    nLoss := 0
+    sumR := 0.0
+
+// Only one position at a time — these are 5m intraday signals, not a portfolio.
+flat = tDir == 0
+openLong  = flat and buySig  and i_manageOn
+openShort = flat and sellSig and i_manageOn
+
+if openLong
+    tDir := 1
+    tEntry := close
+    tStop := longStop
+    tTp1 := longTgt
+    tTp2 := na(longTp2) ? longTgt + atr : longTp2
+    tRisk := math.max(close - longStop, syminfo.mintick)
+    tBar := bar_index
+    tTp1Hit := false
+if openShort
+    tDir := -1
+    tEntry := close
+    tStop := shortStop
+    tTp1 := shortTgt
+    tTp2 := na(shortTp2) ? shortTgt - atr : shortTp2
+    tRisk := math.max(shortStop - close, syminfo.mintick)
+    tBar := bar_index
+    tTp1Hit := false
+
+// Resolve an open trade. Stop is checked before target: if a bar spans both we
+// cannot know which came first intrabar, so assume the loss.
+string exitReason = na
+float  exitPrice  = na
+float  exitR      = na   // captured here; the drawing block clears the trade state
+
+if tDir != 0 and not openLong and not openShort
+    isLong = tDir == 1
+    hitStop = isLong ? low <= tStop : high >= tStop
+    hitTp2  = isLong ? high >= tTp2 : low <= tTp2
+    hitTp1  = isLong ? high >= tTp1 : low <= tTp1
+
+    if hitStop
+        exitReason := tTp1Hit and i_beAtTp1 ? "BE" : "STOP"
+        exitPrice := tStop
+    else if hitTp2
+        exitReason := "TP2"
+        exitPrice := tTp2
+    else
+        if hitTp1 and not tTp1Hit
+            tTp1Hit := true
+            if i_beAtTp1
+                tStop := tEntry          // risk removed, let TP2 run
+        if i_exitFlip and barstate.isconfirmed
+             and ((isLong and score <= -i_thresh) or (not isLong and score >= i_thresh))
+            exitReason := "FLIP"
+            exitPrice := close
+        // 0DTE contracts decay to nothing overnight — never hold past the close.
+        if i_exitEOD and inRth and rthBar >= rthTotal - i_skipEOD and na(exitReason)
+            exitReason := "EOD"
+            exitPrice := close
+
+if not na(exitReason)
+    exitR := tDir == 1 ? (exitPrice - tEntry) / tRisk : (tEntry - exitPrice) / tRisk
+    sumR += exitR
+    if exitR > 0
+        nWin += 1
+    else
+        nLoss += 1
 
 // =============================================================================
 //  Drawing — levels
@@ -340,12 +533,6 @@ f_ray(gexCW2,  c_call, 1, i_showWall and not na(gexCW2),  "CALL W2")
 f_ray(gexPW2,  c_put,  1, i_showWall and not na(gexPW2),  "PUT W2")
 f_ray(cnLvl,   c_node, 2, i_showNode and not na(cnLvl),   hasGex ? "CONTROL NODE" : "POC")
 
-// Expected move envelope around the session open
-var float sessOpen = na
-if newDay
-    sessOpen := open
-emUp = na(gexEM) or na(sessOpen) ? na : sessOpen + gexEM
-emDn = na(gexEM) or na(sessOpen) ? na : sessOpen - gexEM
 f_ray(emUp, color.new(c_call, 40), 1, i_showEM and not na(emUp), "EM +")
 f_ray(emDn, color.new(c_put,  40), 1, i_showEM and not na(emDn), "EM −")
 
@@ -391,16 +578,92 @@ if buySig
     label.new(bar_index, low, f_sigText(true, longTgt, longStop, longRR),
          style = label.style_label_up, color = color.new(#00e676, 20),
          textcolor = color.black, size = size.small)
-    if i_drawProj
+    if i_drawProj and not i_manageOn
         line.new(bar_index, close, bar_index + i_fwd, longTgt,
              color = color.new(#00e676, 30), width = 1, style = line.style_dashed)
 if sellSig
     label.new(bar_index, high, f_sigText(false, shortTgt, shortStop, shortRR),
          style = label.style_label_down, color = color.new(#ff1744, 20),
          textcolor = color.white, size = size.small)
-    if i_drawProj
+    if i_drawProj and not i_manageOn
         line.new(bar_index, close, bar_index + i_fwd, shortTgt,
              color = color.new(#ff1744, 30), width = 1, style = line.style_dashed)
+
+// =============================================================================
+//  Drawing — active trade
+// =============================================================================
+C_WIN  = #00e676
+C_LOSS = #ff1744
+
+var box  bRisk  = na
+var box  bRew   = na
+var line lEntry = na
+var line lStop  = na
+var line lTp1   = na
+var line lTp2   = na
+
+if openLong or openShort
+    isLong = openLong
+    rTop = isLong ? tEntry : tStop
+    rBot = isLong ? tStop  : tEntry
+    wTop = isLong ? tTp1   : tEntry
+    wBot = isLong ? tEntry : tTp1
+    bRisk := box.new(bar_index, rTop, bar_index + 2, rBot,
+         border_color = color.new(C_LOSS, 55), bgcolor = color.new(C_LOSS, 88))
+    bRew := box.new(bar_index, wTop, bar_index + 2, wBot,
+         border_color = color.new(C_WIN, 55), bgcolor = color.new(C_WIN, 88))
+    lEntry := line.new(bar_index, tEntry, bar_index + 2, tEntry,
+         color = color.new(color.white, 20), width = 2)
+    lStop := line.new(bar_index, tStop, bar_index + 2, tStop,
+         color = C_LOSS, width = 1, style = line.style_dashed)
+    lTp1 := line.new(bar_index, tTp1, bar_index + 2, tTp1, color = C_WIN, width = 1)
+    lTp2 := line.new(bar_index, tTp2, bar_index + 2, tTp2,
+         color = color.new(C_WIN, 40), width = 1, style = line.style_dotted)
+    label.new(bar_index, tEntry,
+         (isLong ? "▲ LONG " : "▼ SHORT ") + str.tostring(tEntry, format.mintick) +
+         "\nstop " + str.tostring(tStop, format.mintick) +
+         "\ntp1 "  + str.tostring(tTp1, format.mintick) +
+         "  (" + str.tostring(math.abs(tTp1 - tEntry) / tRisk, "#.#") + "R)" +
+         "\ntp2 "  + str.tostring(tTp2, format.mintick),
+         style = isLong ? label.style_label_upper_right : label.style_label_lower_right,
+         color = color.new(isLong ? C_WIN : C_LOSS, 15),
+         textcolor = isLong ? color.black : color.white, size = size.small)
+
+// Stretch the live trade's drawings to the current bar.
+if tDir != 0 and not na(bRisk)
+    box.set_right(bRisk, bar_index + 2)
+    box.set_right(bRew, bar_index + 2)
+    line.set_x2(lEntry, bar_index + 2)
+    line.set_x2(lStop, bar_index + 2)
+    line.set_x2(lTp1, bar_index + 2)
+    line.set_x2(lTp2, bar_index + 2)
+    // the stop line follows a breakeven move
+    line.set_y1(lStop, tStop)
+    line.set_y2(lStop, tStop)
+    if tTp1Hit
+        line.set_color(lStop, color.new(color.gray, 30))
+
+if not na(exitReason)
+    won = exitR > 0
+    label.new(bar_index, exitPrice,
+         "✕ " + exitReason + "  " + str.tostring(exitR, "+#.##;-#.##") + "R",
+         style = label.style_label_left,
+         color = color.new(won ? C_WIN : C_LOSS, 15),
+         textcolor = won ? color.black : color.white, size = size.small)
+    if not na(bRisk)
+        box.set_right(bRisk, bar_index)
+        box.set_right(bRew, bar_index)
+        line.set_x2(lEntry, bar_index)
+        line.set_x2(lStop, bar_index)
+        line.set_x2(lTp1, bar_index)
+        line.set_x2(lTp2, bar_index)
+    // flat again
+    tDir := 0
+    tEntry := na
+    tStop := na
+    tTp1 := na
+    tTp2 := na
+    tTp1Hit := false
 
 // =============================================================================
 //  HUD
@@ -414,38 +677,64 @@ f_bar(float v) =>
     (v >= 0 ? "+" : "−") + s
 
 if i_hud and barstate.islast
-    var table t = table.new(position.top_right, 2, 8, border_width = 1)
-    table.cell(t, 0, 0, "REGIME", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 0, regime, text_color = posGamma ? c_call : negGamma ? c_put : color.gray,
+    var table t = table.new(position.top_right, 2, 9, border_width = 1)
+    table.cell(t, 0, 0, "SOURCE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 0, hasGex ? "GEX blob loaded" : "AUTO — paste GEX blob",
+         text_color = hasGex ? c_node : color.gray, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 1, "REGIME", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 1, regime, text_color = not hasGex ? color.gray : posGamma ? c_call : c_put,
          text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 1, "SCORE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 1, str.tostring(score, "#.##") + "  " + f_bar(score),
+    table.cell(t, 0, 2, "SCORE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 2, str.tostring(score, "#.##") + "  " + f_bar(score),
          text_color = score > 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 2, "mom / vol", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 2, str.tostring(momScore, "#.##") + " / " + str.tostring(volScore, "#.##"),
+    table.cell(t, 0, 3, "mom / vol", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 3, str.tostring(momScore, "#.##") + " / " + str.tostring(volScore, "#.##"),
          text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 3, "liq / lvl", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 3, str.tostring(liqScore, "#.##") + " / " + str.tostring(lvlScore, "#.##"),
+    table.cell(t, 0, 4, "liq / lvl", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 4, str.tostring(liqScore, "#.##") + " / " + str.tostring(lvlScore, "#.##"),
          text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 4, "RVOL", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 4, str.tostring(rvol, "#.##") + "×",
+    table.cell(t, 0, 5, "RVOL", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 5, str.tostring(rvol, "#.##") + "×",
          text_color = rvol > 1.5 ? #ffd54a : color.silver, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 5, "MAGNET", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 5, na(magnet) ? "—" : str.tostring(magnet, format.mintick) +
+    table.cell(t, 0, 6, "MAGNET", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 6, na(magnet) ? "—" : str.tostring(magnet, format.mintick) +
          "  " + (magnetPull > 0.05 ? "↑" : magnetPull < -0.05 ? "↓" : "•"),
          text_color = c_node, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 6, "PATH ↑", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 6, na(resLvl) ? "—" : str.tostring(resLvl, format.mintick) +
+    table.cell(t, 0, 7, "PATH ↑", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 7, na(resLvl) ? "—" : str.tostring(resLvl, format.mintick) +
          "  (" + str.tostring(dRes, "#.#") + " ATR)", text_color = c_call, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 7, "PATH ↓", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 7, na(supLvl) ? "—" : str.tostring(supLvl, format.mintick) +
+    table.cell(t, 0, 8, "PATH ↓", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 8, na(supLvl) ? "—" : str.tostring(supLvl, format.mintick) +
          "  (" + str.tostring(dSup, "#.#") + " ATR)", text_color = c_put, text_size = size.tiny, text_halign = text.align_right)
+
+// Session scorecard — today's closed trades only, reset each day.
+if i_showStats and i_manageOn and barstate.islast
+    var table st = table.new(position.bottom_right, 2, 4, border_width = 1)
+    nTot = nWin + nLoss
+    table.cell(st, 0, 0, "TRADES", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(st, 1, 0, str.tostring(nTot) + (tDir != 0 ? "  (1 open)" : ""),
+         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(st, 0, 1, "W / L", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(st, 1, 1, str.tostring(nWin) + " / " + str.tostring(nLoss),
+         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(st, 0, 2, "WIN RATE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(st, 1, 2, nTot > 0 ? str.tostring(100.0 * nWin / nTot, "#.#") + "%" : "—",
+         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(st, 0, 3, "TOTAL R", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(st, 1, 3, str.tostring(sumR, "+#.##;-#.##"),
+         text_color = sumR >= 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
 
 // =============================================================================
 //  Alerts
 // =============================================================================
 alertcondition(buySig,  "ITM·GEX Buy",  "BUY {{ticker}} @ {{close}}")
 alertcondition(sellSig, "ITM·GEX Sell", "SELL {{ticker}} @ {{close}}")
+alertcondition(not na(exitReason), "ITM·GEX Exit", "EXIT {{ticker}} @ {{close}}")
+
+if not na(exitReason)
+    alert("EXIT " + syminfo.ticker + " (" + exitReason + ") @ " +
+         str.tostring(exitPrice, format.mintick) + " | " +
+         str.tostring(exitR, "+#.##;-#.##") + "R", alert.freq_once_per_bar_close)
 
 if buySig
     alert("BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +

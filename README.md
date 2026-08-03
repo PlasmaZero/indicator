@@ -100,9 +100,56 @@ A **regime filter** (on by default) additionally blocks longs within 0.4 ATR of
 the call wall and shorts within 0.4 ATR of the put wall while in positive gamma
 — the two setups most reliably punished by dealer suppression.
 
-Targets are the next level in the trade's direction; stops are the wider of a
-5-bar swing and an ATR multiple. Signals only fire on **confirmed bar closes**,
-respect a cooldown, and skip the first and last few bars of the session.
+Signals only fire on **confirmed bar closes**, respect a cooldown, and skip the
+first and last few bars of the session.
+
+---
+
+## Trade management
+
+Every signal becomes a tracked trade drawn on the chart — entry, stop, two
+targets, and the exit when it resolves.
+
+**Targets are GEX levels, not ATR guesses.** Price travels between walls and
+stalls at them, so the levels themselves are the natural exits. TP1 is the next
+level in the trade's direction, TP2 the one beyond it; anything closer than
+0.35 ATR is skipped so TP1 is never a few ticks away. With no chain loaded it
+falls back to prior-day and overnight levels, then to a measured move.
+
+**Stops** sit beyond the 5-bar swing or an ATR multiple, whichever is wider,
+then get capped by *Max risk (ATR mult)* so a distant structural level can't
+create an oversized loss.
+
+On the chart:
+
+| Drawing | Meaning |
+|---|---|
+| White line | Entry |
+| Red dashed + shaded zone | Stop and risk |
+| Green line + shaded zone | TP1 and reward |
+| Green dotted | TP2 |
+| ✕ label | Exit, with reason and R multiple |
+
+Exits fire on: **STOP**, **TP2**, **BE** (stopped after breakeven move),
+**EOD** (flattened at the close — 0DTE contracts decay to nothing overnight),
+and optionally **FLIP** (score reverses against the position). At TP1 the stop
+moves to breakeven by default, so the runner to TP2 is free.
+
+One position at a time — these are intraday signals, not a portfolio.
+
+A **session scorecard** in the bottom right tracks trades, W/L, win rate and
+total R for the day, resetting each morning. It's a live read on whether the
+current settings are working on this symbol, not a backtest.
+
+**Alerts:** *ITM·GEX Buy*, *ITM·GEX Sell* and *ITM·GEX Exit*. The exit alert
+carries the reason and the R multiple.
+
+### Pin guard
+
+Late in the session, in positive gamma, with price parked on the control node,
+dealer hedging tends to keep it there — entries in that state pay the spread and
+go nowhere. *Block new entries pinned to the control node* (on by default)
+suppresses them.
 
 ---
 
@@ -174,6 +221,13 @@ Worth knowing before you risk money on it:
   than optimised. Nothing here is backtested — Pine indicators can't be
   backtested directly; port the logic to a `strategy()` script if you want
   performance numbers before trading it.
+- **The session scorecard is not a backtest.** It counts today's signals on the
+  bars you're looking at, assumes fills at the exact stop/target price, and
+  ignores slippage, spread and option decay — a 5m underlying move of +1R is not
+  +1R on a 0DTE contract. Treat it as a sanity check, not a track record.
+- **Stop and target are assumed to fill at their exact level.** When a single
+  bar spans both, the trade is scored as a loss, since intrabar order can't be
+  known from 5m data.
 - **The engine reads chains, it does not place orders.** No broker integration,
   by design.
 - Expected move uses ATM IV × √T, which understates moves on days with event
