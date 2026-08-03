@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+levels.json
+dashboard.html
+node_modules/

@@ -1,0 +1,459 @@
+//@version=6
+// =============================================================================
+//  ITM GEX Levels + 0DTE Signal Engine
+//
+//  Draws dealer gamma-exposure levels (call wall / put wall / gamma flip /
+//  control node) as horizontal rays, infers the gamma regime from where price
+//  sits relative to the flip, and fires 5m buy/sell signals that combine
+//  momentum, volume/delta, liquidity events and level context.
+//
+//  Levels come from tools/gex_engine.py (paste the blob into "GEX blob").
+//  With no blob the indicator falls back to auto levels derived from price,
+//  volume profile and VWAP so it still works on any symbol.
+// =============================================================================
+indicator("ITM GEX Levels + 0DTE Signal Engine", "ITM·GEX", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+G_LVL  = "1 · GEX levels"
+G_PROF = "2 · GEX profile"
+G_AUTO = "3 · Auto levels (fallback)"
+G_SIG  = "4 · Signal engine"
+G_RISK = "5 · Targets & risk"
+G_UI   = "6 · Display"
+
+// ── GEX level inputs ─────────────────────────────────────────────────────────
+i_blob = input.text_area("", "GEX blob",
+     tooltip = "Paste from gex_engine.py, e.g.\n" +
+               "flip:757.2,cw:762,pw:750,cn:758,cw2:765,pw2:745,net:1.24,em:4.8",
+     group = G_LVL)
+i_showFlip = input.bool(true,  "Gamma flip (HVL)",  group = G_LVL, inline = "a")
+i_showWall = input.bool(true,  "Call / put walls",  group = G_LVL, inline = "a")
+i_showNode = input.bool(true,  "Control node",      group = G_LVL, inline = "b")
+i_showEM   = input.bool(true,  "Expected move",     group = G_LVL, inline = "b")
+
+// ── Per-strike profile (optional, mirrors the GEX panel) ─────────────────────
+i_prof = input.text_area("", "Strike profile",
+     tooltip = "strike=gex pairs in $M, comma separated:\n750=-2.76,755=1.24,757.5=10.31",
+     group = G_PROF)
+i_profShow  = input.bool(true, "Draw profile rays", group = G_PROF)
+i_profMax   = input.int(24, "Max strikes", minval = 2, maxval = 40, group = G_PROF)
+i_profWidth = input.int(6,  "Max ray width", minval = 1, maxval = 10, group = G_PROF)
+
+// ── Auto-level fallback ──────────────────────────────────────────────────────
+i_autoOn   = input.bool(true, "Use auto levels when blob is empty", group = G_AUTO)
+i_showPDHL = input.bool(true, "Prior day high/low", group = G_AUTO)
+i_showONHL = input.bool(true, "Overnight high/low", group = G_AUTO)
+i_showVWAP = input.bool(true, "VWAP + 1σ bands",    group = G_AUTO)
+
+// ── Signal engine ────────────────────────────────────────────────────────────
+i_sigOn    = input.bool(true, "Enable signals", group = G_SIG)
+i_rthOnly  = input.bool(true, "Regular hours only", group = G_SIG)
+i_skipOpen = input.int(2,  "Skip first N bars",  minval = 0, maxval = 12, group = G_SIG)
+i_skipEOD  = input.int(2,  "Skip last N bars",   minval = 0, maxval = 12, group = G_SIG)
+i_thresh   = input.float(0.34, "Signal threshold", minval = 0.05, maxval = 0.95, step = 0.01, group = G_SIG)
+i_cooldown = input.int(5, "Cooldown bars", minval = 0, maxval = 50, group = G_SIG)
+i_regimeF  = input.bool(true, "Regime filter", group = G_SIG,
+     tooltip = "In positive gamma, block longs pressed into the call wall and shorts pressed into the put wall (dealers suppress moves there).")
+
+w_mom = input.float(30, "Weight · momentum",  minval = 0, maxval = 100, group = G_SIG, inline = "w1")
+w_vol = input.float(25, "Weight · volume",    minval = 0, maxval = 100, group = G_SIG, inline = "w1")
+w_liq = input.float(25, "Weight · liquidity", minval = 0, maxval = 100, group = G_SIG, inline = "w2")
+w_lvl = input.float(20, "Weight · levels",    minval = 0, maxval = 100, group = G_SIG, inline = "w2")
+
+i_emaFast = input.int(9,  "EMA fast", minval = 2, group = G_SIG, inline = "m")
+i_emaSlow = input.int(21, "EMA slow", minval = 3, group = G_SIG, inline = "m")
+i_rvolLen = input.int(20, "RVOL length", minval = 5, group = G_SIG, inline = "v")
+i_cvdLen  = input.int(6,  "Delta slope bars", minval = 2, group = G_SIG, inline = "v")
+i_swing   = input.int(10, "Sweep lookback", minval = 3, group = G_SIG, inline = "l")
+
+// ── Targets & risk ───────────────────────────────────────────────────────────
+i_minRR    = input.float(1.3, "Min reward:risk", minval = 0.2, step = 0.1, group = G_RISK)
+i_stopATR  = input.float(1.1, "Stop (ATR mult)", minval = 0.2, step = 0.1, group = G_RISK)
+i_drawProj = input.bool(true, "Draw target projection", group = G_RISK)
+
+// ── Display ──────────────────────────────────────────────────────────────────
+i_back = input.int(60, "Ray look-back bars", minval = 0, maxval = 500, group = G_UI)
+i_fwd  = input.int(18, "Ray extension bars", minval = 1, maxval = 200, group = G_UI)
+i_hud  = input.bool(true, "Show HUD", group = G_UI)
+c_call = input.color(#2962ff, "Call wall / +GEX", group = G_UI, inline = "c1")
+c_put  = input.color(#ff2d3f, "Put wall / -GEX",  group = G_UI, inline = "c1")
+c_flip = input.color(#e8eaed, "Gamma flip",       group = G_UI, inline = "c2")
+c_node = input.color(#ffd54a, "Control node",     group = G_UI, inline = "c2")
+
+// =============================================================================
+//  Blob parsing
+// =============================================================================
+f_key(string blob, string key) =>
+    float out = na
+    if str.length(blob) > 0
+        parts = str.split(str.replace_all(blob, " ", ""), ",")
+        for i = 0 to array.size(parts) - 1
+            kv = str.split(array.get(parts, i), ":")
+            if array.size(kv) == 2 and array.get(kv, 0) == key
+                out := str.tonumber(array.get(kv, 1))
+    out
+
+var float gexFlip = f_key(i_blob, "flip")
+var float gexCW   = f_key(i_blob, "cw")
+var float gexPW   = f_key(i_blob, "pw")
+var float gexCN   = f_key(i_blob, "cn")
+var float gexCW2  = f_key(i_blob, "cw2")
+var float gexPW2  = f_key(i_blob, "pw2")
+var float gexNet  = f_key(i_blob, "net")
+var float gexEM   = f_key(i_blob, "em")
+
+var bool hasGex = not na(gexFlip) or not na(gexCW) or not na(gexPW)
+
+// Per-strike profile: "strike=gex" pairs
+var float[] pStrike = array.new<float>()
+var float[] pGex    = array.new<float>()
+var float   pMaxAbs = 0.0
+
+if barstate.isfirst and str.length(i_prof) > 0
+    rows = str.split(str.replace_all(i_prof, " ", ""), ",")
+    for i = 0 to math.min(array.size(rows), i_profMax) - 1
+        kv = str.split(array.get(rows, i), "=")
+        if array.size(kv) == 2
+            k = str.tonumber(array.get(kv, 0))
+            v = str.tonumber(array.get(kv, 1))
+            if not na(k) and not na(v)
+                array.push(pStrike, k)
+                array.push(pGex, v)
+                pMaxAbs := math.max(pMaxAbs, math.abs(v))
+
+// =============================================================================
+//  Auto levels
+// =============================================================================
+newDay = timeframe.change("D")
+atr    = ta.atr(14)
+vwap   = ta.vwap(hlc3)
+vwapSd = ta.stdev(close - vwap, 40)
+
+// Prior day / overnight
+var float pdh = na
+var float pdl = na
+var float dHi = na
+var float dLo = na
+if newDay
+    pdh := dHi
+    pdl := dLo
+    dHi := high
+    dLo := low
+else
+    dHi := math.max(nz(dHi, high), high)
+    dLo := math.min(nz(dLo, low), low)
+
+inRth = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+var float onh = na
+var float onl = na
+if newDay
+    onh := na
+    onl := na
+if not inRth
+    onh := na(onh) ? high : math.max(onh, high)
+    onl := na(onl) ? low  : math.min(onl, low)
+
+// Session volume profile → point of control (auto "control node")
+var map<int, float> vp = map.new<int, float>()
+var float bkt = na
+if newDay or na(bkt)
+    map.clear(vp)
+    bkt := math.max(syminfo.mintick, math.round(nz(atr, close * 0.002) * 0.15 / syminfo.mintick) * syminfo.mintick)
+int vpKey = int(math.round(hlc3 / bkt))
+map.put(vp, vpKey, nz(map.get(vp, vpKey)) + volume)
+
+f_poc() =>
+    float best = na
+    float bestV = 0.0
+    ks = map.keys(vp)
+    // `for 0 to size-1` would count downward on an empty map and index out of range
+    if array.size(ks) > 0
+        for i = 0 to array.size(ks) - 1
+            k = array.get(ks, i)
+            v = nz(map.get(vp, k))
+            if v > bestV
+                bestV := v
+                best := k * bkt
+    best
+poc = barstate.islast ? f_poc() : na
+
+// Effective levels: GEX when supplied, otherwise auto proxies
+flipLvl = hasGex ? gexFlip : (i_autoOn ? vwap : na)
+cwLvl   = hasGex ? gexCW   : (i_autoOn ? math.max(nz(pdh, dHi), dHi) : na)
+pwLvl   = hasGex ? gexPW   : (i_autoOn ? math.min(nz(pdl, dLo), dLo) : na)
+cnLvl   = hasGex ? gexCN   : (i_autoOn ? poc : na)
+
+// =============================================================================
+//  Regime
+// =============================================================================
+// Above the flip dealers are net long gamma: they sell rallies and buy dips,
+// which compresses range and pins price toward the control node.
+// Below it they are short gamma: hedging amplifies moves and trends extend.
+posGamma = not na(flipLvl) and close > flipLvl
+negGamma = not na(flipLvl) and close < flipLvl
+regime   = posGamma ? "POSITIVE γ · mean-revert / pin" : negGamma ? "NEGATIVE γ · trend / expand" : "NO GEX · price-only"
+
+// =============================================================================
+//  Signal components  (each returns roughly -1 … +1)
+// =============================================================================
+emaF = ta.ema(close, i_emaFast)
+emaS = ta.ema(close, i_emaSlow)
+rsi  = ta.rsi(close, 14)
+
+f_clamp(float v) => math.max(-1.0, math.min(1.0, v))
+
+// 1 · Momentum — normalised EMA spread blended with RSI displacement
+momSpread = atr > 0 ? (emaF - emaS) / atr : 0.0
+momScore  = f_clamp(momSpread / 0.6) * 0.6 + f_clamp((rsi - 50) / 25) * 0.4
+
+// 2 · Volume — session cumulative delta slope, scaled by relative volume
+rng      = math.max(high - low, syminfo.mintick)
+barDelta = (2 * (close - low) / rng - 1) * volume
+var float cvd = 0.0
+cvd := newDay ? barDelta : cvd + barDelta
+cvdSlope = cvd - cvd[i_cvdLen]
+cvdNorm  = ta.stdev(cvdSlope, 50)
+rvol     = volume / math.max(ta.sma(volume, i_rvolLen), 1)
+volScore = f_clamp(cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0) * f_clamp(0.45 + rvol / 2.2)
+
+// 3 · Liquidity — failed sweeps of prior swings, VWAP stretch, displacement
+swHi = ta.highest(high, i_swing)[1]
+swLo = ta.lowest(low, i_swing)[1]
+sweepHi = high > swHi and close < swHi          // ran stops above, closed back in → bearish
+sweepLo = low  < swLo and close > swLo          // ran stops below, closed back in → bullish
+disp    = atr > 0 ? (close - open) / atr : 0.0
+stretch = atr > 0 ? (close - vwap) / math.max(vwapSd, atr * 0.5) : 0.0
+// Clamped so every component shares the same -1…+1 range and the configured
+// weights mean what they say.
+liqScore = f_clamp((sweepLo ? 0.7 : 0.0) - (sweepHi ? 0.7 : 0.0)
+     + f_clamp(disp / 1.2) * 0.4 - f_clamp(stretch / 2.5) * 0.3)
+
+// 4 · Levels — behaviour into the nearest wall, direction of the magnet
+f_nearestAbove(float a, float b, float c, float d) =>
+    float r = na
+    if not na(a) and a > close
+        r := na(r) ? a : math.min(r, a)
+    if not na(b) and b > close
+        r := na(r) ? b : math.min(r, b)
+    if not na(c) and c > close
+        r := na(r) ? c : math.min(r, c)
+    if not na(d) and d > close
+        r := na(r) ? d : math.min(r, d)
+    r
+f_nearestBelow(float a, float b, float c, float d) =>
+    float r = na
+    if not na(a) and a < close
+        r := na(r) ? a : math.max(r, a)
+    if not na(b) and b < close
+        r := na(r) ? b : math.max(r, b)
+    if not na(c) and c < close
+        r := na(r) ? c : math.max(r, c)
+    if not na(d) and d < close
+        r := na(r) ? d : math.max(r, d)
+    r
+
+resLvl = f_nearestAbove(cwLvl, gexCW2, cnLvl, flipLvl)
+supLvl = f_nearestBelow(pwLvl, gexPW2, cnLvl, flipLvl)
+dRes   = na(resLvl) or atr <= 0 ? na : (resLvl - close) / atr
+dSup   = na(supLvl) or atr <= 0 ? na : (close - supLvl) / atr
+
+// Magnet pull toward the control node, strongest in positive gamma
+magnet    = na(cnLvl) ? na : cnLvl
+magnetPull = na(magnet) or atr <= 0 ? 0.0 : f_clamp((magnet - close) / (atr * 3))
+
+float lvlScore = 0.0
+if posGamma
+    // Fade the edges, respect the pin.
+    lvlScore := magnetPull * 0.6
+    lvlScore += (not na(dRes) and dRes < 0.6 ? -0.4 : 0.0)
+    lvlScore += (not na(dSup) and dSup < 0.6 ?  0.4 : 0.0)
+else if negGamma
+    // Acceptance through a level tends to extend rather than revert.
+    brokeUp = not na(resLvl) and close > resLvl and close[1] <= resLvl
+    brokeDn = not na(supLvl) and close < supLvl and close[1] >= supLvl
+    lvlScore := (brokeUp ? 0.7 : 0.0) - (brokeDn ? 0.7 : 0.0) + magnetPull * 0.25
+else
+    lvlScore := magnetPull * 0.4
+
+wSum  = math.max(w_mom + w_vol + w_liq + w_lvl, 1)
+score = (momScore * w_mom + volScore * w_vol + liqScore * w_liq + lvlScore * w_lvl) / wSum
+
+// =============================================================================
+//  Signal gating
+// =============================================================================
+// Count bars elapsed in the regular session so the open/close windows can be
+// skipped in bar terms rather than against a hard-coded clock.
+var int rthBar = 0
+rthBar := inRth ? rthBar + 1 : 0
+tfMin    = math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
+rthTotal = math.round(390.0 / tfMin)
+
+sessionOk = not i_rthOnly or inRth
+openOk    = inRth ? rthBar > i_skipOpen : not i_rthOnly
+eodOk     = inRth ? rthBar <= rthTotal - i_skipEOD : not i_rthOnly
+
+// Targets: next level in the trade's direction
+longTgt  = na(resLvl) ? close + atr * 2.0 : resLvl
+shortTgt = na(supLvl) ? close - atr * 2.0 : supLvl
+longStop  = math.min(ta.lowest(low, 5), close - atr * i_stopATR)
+shortStop = math.max(ta.highest(high, 5), close + atr * i_stopATR)
+longRR  = (close - longStop)  > 0 ? (longTgt - close)  / (close - longStop)  : 0.0
+shortRR = (shortStop - close) > 0 ? (close - shortTgt) / (shortStop - close) : 0.0
+
+// Positive gamma suppresses continuation into a wall — don't buy the ceiling.
+blockLong  = i_regimeF and posGamma and not na(dRes) and dRes < 0.4
+blockShort = i_regimeF and posGamma and not na(dSup) and dSup < 0.4
+
+var int lastSig = -1000
+canFire = i_sigOn and sessionOk and openOk and eodOk and barstate.isconfirmed and (bar_index - lastSig) > i_cooldown
+
+buySig  = canFire and score >=  i_thresh and longRR  >= i_minRR and not blockLong
+sellSig = canFire and score <= -i_thresh and shortRR >= i_minRR and not blockShort
+
+if buySig or sellSig
+    lastSig := bar_index
+
+// =============================================================================
+//  Drawing — levels
+// =============================================================================
+f_ray(float price, color col, int width, bool show, string txt) =>
+    var line  glow = na
+    var line  core = na
+    var label tag  = na
+    if barstate.islast
+        line.delete(glow)
+        line.delete(core)
+        label.delete(tag)
+        if show and not na(price)
+            x1 = bar_index - i_back
+            x2 = bar_index + i_fwd
+            glow := line.new(x1, price, x2, price, color = color.new(col, 78), width = width + 4)
+            core := line.new(x1, price, x2, price, color = col, width = width)
+            tag  := label.new(x2, price, txt + "  " + str.tostring(price, format.mintick),
+                 style = label.style_label_left, color = color.new(col, 15),
+                 textcolor = color.white, size = size.small)
+
+f_ray(flipLvl, c_flip, 2, i_showFlip and not na(flipLvl), hasGex ? "FLIP" : "VWAP")
+f_ray(cwLvl,   c_call, 3, i_showWall and not na(cwLvl),   hasGex ? "CALL WALL" : "PDH")
+f_ray(pwLvl,   c_put,  3, i_showWall and not na(pwLvl),   hasGex ? "PUT WALL"  : "PDL")
+f_ray(gexCW2,  c_call, 1, i_showWall and not na(gexCW2),  "CALL W2")
+f_ray(gexPW2,  c_put,  1, i_showWall and not na(gexPW2),  "PUT W2")
+f_ray(cnLvl,   c_node, 2, i_showNode and not na(cnLvl),   hasGex ? "CONTROL NODE" : "POC")
+
+// Expected move envelope around the session open
+var float sessOpen = na
+if newDay
+    sessOpen := open
+emUp = na(gexEM) or na(sessOpen) ? na : sessOpen + gexEM
+emDn = na(gexEM) or na(sessOpen) ? na : sessOpen - gexEM
+f_ray(emUp, color.new(c_call, 40), 1, i_showEM and not na(emUp), "EM +")
+f_ray(emDn, color.new(c_put,  40), 1, i_showEM and not na(emDn), "EM −")
+
+// Auto extras
+f_ray(pdh,  color.new(color.gray, 20), 1, i_showPDHL and not hasGex and not na(pdh), "PDH")
+f_ray(pdl,  color.new(color.gray, 20), 1, i_showPDHL and not hasGex and not na(pdl), "PDL")
+f_ray(onh,  color.new(color.teal, 20), 1, i_showONHL and not na(onh), "ONH")
+f_ray(onl,  color.new(color.teal, 20), 1, i_showONHL and not na(onl), "ONL")
+
+plot(i_showVWAP ? vwap : na, "VWAP", color.new(color.orange, 20), 1)
+plot(i_showVWAP ? vwap + vwapSd : na, "VWAP +1σ", color.new(color.orange, 70), 1)
+plot(i_showVWAP ? vwap - vwapSd : na, "VWAP −1σ", color.new(color.orange, 70), 1)
+
+// Per-strike profile rays, width scaled by |GEX| — the panel from the screenshot
+var line[] profLines = array.new<line>()
+if barstate.islast and i_profShow and array.size(pStrike) > 0
+    if array.size(profLines) > 0
+        for i = 0 to array.size(profLines) - 1
+            line.delete(array.get(profLines, i))
+        array.clear(profLines)
+    for i = 0 to array.size(pStrike) - 1
+        s = array.get(pStrike, i)
+        g = array.get(pGex, i)
+        mag = pMaxAbs > 0 ? math.abs(g) / pMaxAbs : 0.0
+        int w = math.max(1, int(math.round(mag * i_profWidth)))
+        c = color.new(g >= 0 ? c_call : c_put, int(math.round(85 - mag * 55)))
+        array.push(profLines, line.new(bar_index - i_back, s, bar_index + i_fwd, s, color = c, width = w))
+
+// =============================================================================
+//  Drawing — signals
+// =============================================================================
+plotshape(buySig,  "BUY",  shape.triangleup,   location.belowbar, color.new(#00e676, 0), size = size.small)
+plotshape(sellSig, "SELL", shape.triangledown, location.abovebar, color.new(#ff1744, 0), size = size.small)
+
+f_sigText(bool isLong, float tgt, float stp, float rr) =>
+    (isLong ? "BUY" : "SELL") + "  " + str.tostring(close, format.mintick) +
+     "\ntgt " + str.tostring(tgt, format.mintick) +
+     "  stop " + str.tostring(stp, format.mintick) +
+     "\nR " + str.tostring(rr, "#.##") + "  · " + (posGamma ? "γ+" : negGamma ? "γ−" : "γ?") +
+     "  RVOL " + str.tostring(rvol, "#.#")
+
+if buySig
+    label.new(bar_index, low, f_sigText(true, longTgt, longStop, longRR),
+         style = label.style_label_up, color = color.new(#00e676, 20),
+         textcolor = color.black, size = size.small)
+    if i_drawProj
+        line.new(bar_index, close, bar_index + i_fwd, longTgt,
+             color = color.new(#00e676, 30), width = 1, style = line.style_dashed)
+if sellSig
+    label.new(bar_index, high, f_sigText(false, shortTgt, shortStop, shortRR),
+         style = label.style_label_down, color = color.new(#ff1744, 20),
+         textcolor = color.white, size = size.small)
+    if i_drawProj
+        line.new(bar_index, close, bar_index + i_fwd, shortTgt,
+             color = color.new(#ff1744, 30), width = 1, style = line.style_dashed)
+
+// =============================================================================
+//  HUD
+// =============================================================================
+f_bar(float v) =>
+    int n = int(math.round(math.abs(v) * 5))
+    string s = ""
+    if n > 0
+        for i = 1 to n
+            s := s + "█"
+    (v >= 0 ? "+" : "−") + s
+
+if i_hud and barstate.islast
+    var table t = table.new(position.top_right, 2, 8, border_width = 1)
+    table.cell(t, 0, 0, "REGIME", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 0, regime, text_color = posGamma ? c_call : negGamma ? c_put : color.gray,
+         text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 1, "SCORE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 1, str.tostring(score, "#.##") + "  " + f_bar(score),
+         text_color = score > 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 2, "mom / vol", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 2, str.tostring(momScore, "#.##") + " / " + str.tostring(volScore, "#.##"),
+         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 3, "liq / lvl", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 3, str.tostring(liqScore, "#.##") + " / " + str.tostring(lvlScore, "#.##"),
+         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 4, "RVOL", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 4, str.tostring(rvol, "#.##") + "×",
+         text_color = rvol > 1.5 ? #ffd54a : color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 5, "MAGNET", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 5, na(magnet) ? "—" : str.tostring(magnet, format.mintick) +
+         "  " + (magnetPull > 0.05 ? "↑" : magnetPull < -0.05 ? "↓" : "•"),
+         text_color = c_node, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 6, "PATH ↑", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 6, na(resLvl) ? "—" : str.tostring(resLvl, format.mintick) +
+         "  (" + str.tostring(dRes, "#.#") + " ATR)", text_color = c_call, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(t, 0, 7, "PATH ↓", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, 7, na(supLvl) ? "—" : str.tostring(supLvl, format.mintick) +
+         "  (" + str.tostring(dSup, "#.#") + " ATR)", text_color = c_put, text_size = size.tiny, text_halign = text.align_right)
+
+// =============================================================================
+//  Alerts
+// =============================================================================
+alertcondition(buySig,  "ITM·GEX Buy",  "BUY {{ticker}} @ {{close}}")
+alertcondition(sellSig, "ITM·GEX Sell", "SELL {{ticker}} @ {{close}}")
+
+if buySig
+    alert("BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+         " | tgt " + str.tostring(longTgt, format.mintick) +
+         " | stop " + str.tostring(longStop, format.mintick) +
+         " | R " + str.tostring(longRR, "#.##") + " | " + regime, alert.freq_once_per_bar_close)
+if sellSig
+    alert("SELL " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+         " | tgt " + str.tostring(shortTgt, format.mintick) +
+         " | stop " + str.tostring(shortStop, format.mintick) +
+         " | R " + str.tostring(shortRR, "#.##") + " | " + regime, alert.freq_once_per_bar_close)
