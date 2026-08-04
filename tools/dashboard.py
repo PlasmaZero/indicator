@@ -81,7 +81,14 @@ h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 2px; letter-spacing: -0.0
   border: 1px solid var(--border);
 }
 .tab[aria-selected="true"] { background: var(--text-primary); color: var(--surface-1); border-color: transparent; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.tile.pos { box-shadow: inset 3px 0 0 var(--pos); }
+.tile.neg { box-shadow: inset 3px 0 0 var(--neg); }
+.strip { display: flex; flex-wrap: wrap; gap: 6px 8px; margin-bottom: 18px; }
+.strip span { background: var(--surface-1); border: 1px solid var(--border); border-radius: 7px;
+  padding: 5px 10px; font-size: 0.75rem; color: var(--text-primary);
+  font-variant-numeric: tabular-nums; }
+.strip b { color: var(--muted); font-weight: 500; margin-right: 6px; }
 .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
 .tile .k { font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 6px; }
 .tile .v { font-size: 1.375rem; font-weight: 600; line-height: 1.1; }
@@ -108,13 +115,23 @@ th { color: var(--muted); font-weight: 500; font-size: 0.6875rem; text-transform
   font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.05em; }
 .toggle { font: inherit; font-size: 0.75rem; color: var(--text-secondary); background: none;
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.live { display: inline-flex; align-items: center; gap: 5px; font-weight: 600;
+  color: var(--pos); letter-spacing: 0.04em; }
+.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--pos);
+  display: inline-block; animation: pulse 2s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.25 } }
+@media (prefers-reduced-motion: reduce) { .live i { animation: none } }
+body.stale .live { color: var(--muted); }
+body.stale .live i { background: var(--muted); animation: none; }
 #tip { position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
   background: var(--text-primary); color: var(--surface-1); font-size: 0.75rem;
   padding: 7px 10px; border-radius: 7px; z-index: 20; white-space: nowrap; font-variant-numeric: tabular-nums; }
 """
 
 JS = r"""
-const DATA = __DATA__;
+let DATA = __DATA__;
+const LIVE = __LIVE__, POLL_MS = __POLL_MS__;
+let curSym = null;
 const $ = (s, r) => (r || document).querySelector(s);
 const money = v => {
   const a = Math.abs(v);
@@ -234,11 +251,22 @@ function chart(d) {
     // strike label
     s += `<text class="tick" x="${padL-12}" y="${px(y+h/2+3.5)}" text-anchor="end"`
        + (isNode ? ' font-weight="700" fill="var(--text-primary)"' : '') + `>${k}</text>`;
-    // selective direct labels: only the strongest strikes
+    // Selective direct labels on the strongest strikes only. A label that would
+    // run into the right gutter (where the SPOT/FLIP labels live) flips inside
+    // the bar instead of overlapping them.
     if (Math.abs(v) / maxAbs > 0.35) {
-      const anchor = v >= 0 ? 'start' : 'end';
-      const lx = x1 + (v >= 0 ? 6 : -6);
-      s += `<text class="barlabel" x="${px(lx)}" y="${px(y+h/2+3.5)}" text-anchor="${anchor}">${money(v)}</text>`;
+      const txt = money(v);
+      const wEst = txt.length * 6.2 + 8;
+      const outward = v >= 0 ? 1 : -1;
+      const outX = x1 + outward * 6;
+      const fits = v >= 0 ? (outX + wEst < W - padR) : (outX - wEst > padL);
+      if (fits) {
+        s += `<text class="barlabel" x="${px(outX)}" y="${px(y+h/2+3.5)}"`
+           + ` text-anchor="${v >= 0 ? 'start' : 'end'}">${txt}</text>`;
+      } else if (Math.abs(x1 - cx) > wEst) {
+        s += `<text class="barlabel" x="${px(x1 - outward * 6)}" y="${px(y+h/2+3.5)}"`
+           + ` text-anchor="${v >= 0 ? 'end' : 'start'}" fill="#fff">${txt}</text>`;
+      }
     }
   });
 
@@ -261,32 +289,38 @@ function table(d) {
 
 function render(sym) {
   const d = DATA.find(x => x.symbol === sym);
+  if (!d) return;
+  curSym = sym;
   document.querySelectorAll('.tab').forEach(t =>
     t.setAttribute('aria-selected', String(t.dataset.sym === sym)));
 
   const posG = d.gamma_flip != null && d.spot > d.gamma_flip;
   const regime = d.gamma_flip == null ? 'Unknown' : posG ? 'Positive' : 'Negative';
   const regimeNote = d.gamma_flip == null ? 'no flip found in range'
-    : posG ? 'γ — dealers dampen moves, fade extremes and expect pinning'
-           : 'γ — dealers amplify moves, favour continuation';
+    : posG ? 'dampens moves — fade extremes' : 'amplifies moves — favour continuation';
 
+  const n2 = v => v == null ? '—' : v.toFixed(2);
+  const n0 = v => v == null ? '—' : v.toFixed(0);
+
+  // Four headline tiles; everything else drops to a compact strip so the top of
+  // the page answers "what regime, and where is it pulling" at a glance.
   $('#tiles').innerHTML = `
-    <div class="tile"><div class="k">Spot</div><div class="v">${d.spot.toFixed(2)}</div>
+    <div class="tile"><div class="k">Spot</div><div class="v">${n2(d.spot)}</div>
       <div class="n">exp ${d.expiry}</div></div>
-    <div class="tile"><div class="k">Net GEX</div><div class="v">${money(d.net_gex)}</div>
-      <div class="n">per 1% move</div></div>
-    <div class="tile"><div class="k">Regime</div><div class="v">${regime}</div>
-      <div class="n">${regimeNote}</div></div>
-    <div class="tile"><div class="k">Gamma flip</div><div class="v">${d.gamma_flip == null ? '—' : d.gamma_flip.toFixed(2)}</div>
-      <div class="n">zero-gamma level</div></div>
-    <div class="tile"><div class="k">Expected move</div><div class="v">${d.expected_move == null ? '—' : '±' + d.expected_move.toFixed(2)}</div>
-      <div class="n">atm iv ${d.atm_iv == null ? '—' : (d.atm_iv*100).toFixed(1) + '%'}</div></div>
-    <div class="tile"><div class="k">Control node</div><div class="v">${d.control_node == null ? '—' : d.control_node.toFixed(2)}</div>
-      <div class="n">largest |gamma| strike</div></div>
-    <div class="tile"><div class="k">GEX walls</div><div class="v">${d.put_wall == null ? '—' : d.put_wall.toFixed(0)} / ${d.call_wall == null ? '—' : d.call_wall.toFixed(0)}</div>
-      <div class="n">gamma-weighted put / call</div></div>
-    <div class="tile"><div class="k">OI walls</div><div class="v">${d.put_wall_oi == null ? '—' : d.put_wall_oi.toFixed(0)} / ${d.call_wall_oi == null ? '—' : d.call_wall_oi.toFixed(0)}</div>
-      <div class="n">where the size sits</div></div>`;
+    <div class="tile ${posG ? 'pos' : 'neg'}"><div class="k">Regime</div>
+      <div class="v">${regime} γ</div><div class="n">${regimeNote}</div></div>
+    <div class="tile"><div class="k">Gamma flip</div><div class="v">${n2(d.gamma_flip)}</div>
+      <div class="n">regime divider</div></div>
+    <div class="tile"><div class="k">Control node</div><div class="v">${n2(d.control_node)}</div>
+      <div class="n">the magnet</div></div>`;
+
+  $('#strip').innerHTML = [
+    ['Net GEX', money(d.net_gex) + ' /1%'],
+    ['Expected move', d.expected_move == null ? '—' : '±' + d.expected_move.toFixed(2)],
+    ['ATM IV', d.atm_iv == null ? '—' : (d.atm_iv * 100).toFixed(1) + '%'],
+    ['GEX walls', n0(d.put_wall) + ' / ' + n0(d.call_wall)],
+    ['OI walls', n0(d.put_wall_oi) + ' / ' + n0(d.call_wall_oi)],
+  ].map(([k, v]) => `<span><b>${k}</b>${v}</span>`).join('');
 
   $('#chart').innerHTML = chart(d);
   $('#table').innerHTML = table(d);
@@ -313,6 +347,26 @@ $('#tableToggle').addEventListener('click', () => {
   $('#tableToggle').textContent = open ? 'Hide data table' : 'Show data table';
 });
 render(DATA[0].symbol);
+
+// Live mode: the server re-fetches the chain on its own cadence; poll it and
+// repaint in place so the open tab and scroll position survive the update.
+if (LIVE) {
+  setInterval(async () => {
+    try {
+      const r = await fetch('/api/levels', { cache: 'no-store' });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      if (!j.levels || !j.levels.length) return;
+      DATA = j.levels;
+      render(curSym && DATA.some(d => d.symbol === curSym) ? curSym : DATA[0].symbol);
+      const s = $('#stamp');
+      if (s) s.textContent = j.updated || '';
+      document.body.classList.toggle('stale', !!j.error);
+    } catch (e) {
+      document.body.classList.add('stale');
+    }
+  }, POLL_MS);
+}
 """
 
 PAGE = """<!doctype html>
@@ -326,9 +380,10 @@ PAGE = """<!doctype html>
 <body>
 <div class="viz-root"><div class="wrap">
   <h1>Dealer gamma exposure</h1>
-  <p class="sub">Generated %(stamp)s · levels feed the Pine indicator</p>
+  <p class="sub">%(stamp)s</p>
   <div class="tabs" role="tablist">%(tabs)s</div>
   <div class="tiles" id="tiles"></div>
+  <div class="strip" id="strip"></div>
 
   <div class="card">
     <h2>GEX by strike</h2>
@@ -360,7 +415,8 @@ PAGE = """<!doctype html>
 """
 
 
-def render_dashboard(levels_list) -> str:
+def payload_for(levels_list) -> list[dict]:
+    """Serialisable view of the levels — shared by the page and the live API."""
     from gex_engine import pine_blob, pine_profile
 
     payload = []
@@ -370,17 +426,26 @@ def render_dashboard(levels_list) -> str:
         d["pine_blob"] = pine_blob(lv)
         d["pine_profile"] = pine_profile(lv)
         payload.append(d)
+    return payload
 
+
+def render_dashboard(levels_list, live: bool = False, poll_ms: int = 30000) -> str:
+    payload = payload_for(levels_list)
     tabs = "".join(
         f'<button class="tab" role="tab" data-sym="{d["symbol"]}" '
         f'aria-selected="false">{d["symbol"]}</button>'
         for d in payload
     )
-    js = JS.replace("__DATA__", json.dumps(payload))
+    js = (JS.replace("__DATA__", json.dumps(payload))
+            .replace("__LIVE__", "true" if live else "false")
+            .replace("__POLL_MS__", str(poll_ms)))
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return PAGE % {
         "symbols": ", ".join(d["symbol"] for d in payload),
         "css": CSS,
         "js": js,
         "tabs": tabs,
-        "stamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "stamp": ('<span class="live"><i></i>LIVE</span> polling every '
+                  f'{poll_ms // 1000}s · <span id="stamp">{stamp}</span>'
+                  if live else f"Generated {stamp}") + " · levels feed the Pine indicator",
     }

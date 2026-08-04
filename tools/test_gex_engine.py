@@ -3,8 +3,10 @@
 
 import math
 import sys
+import time
 from datetime import date, datetime, timezone
 
+import gex_engine
 from gex_engine import (
     Contract, bs_gamma, year_fraction, derive_levels, pine_blob, pine_profile,
     strike_gex,
@@ -150,6 +152,71 @@ check("data is embedded, no external requests",
 check("payload reached the page", '"symbol": "SPY"' in html or '"symbol":"SPY"' in html)
 check("both theme scopes present",
       "prefers-color-scheme: dark" in html and '[data-theme="dark"]' in html)
+check("static page is not in live mode", "const LIVE = false" in html)
+
+from dashboard import payload_for
+pl = payload_for([lv])
+check("payload carries blobs for the API",
+      pl[0]["pine_blob"] and pl[0]["pine_profile"])
+check("payload profile is JSON-safe pairs",
+      isinstance(pl[0]["profile"], list) and isinstance(pl[0]["profile"][0], list))
+
+live_html = render_dashboard([lv], live=True, poll_ms=30000)
+check("live mode sets the flag and interval",
+      "const LIVE = true" in live_html and "POLL_MS = 30000" in live_html)
+check("live mode renders the LIVE badge", 'class="live"' in live_html)
+
+# ---------------------------------------------------------------------------
+print("\nLive server")
+import json as _json
+import threading
+import urllib.request
+
+_orig_loader = gex_engine.load_yfinance
+_ticks = {"n": 0}
+
+
+def _fake_chain(sym, dte):
+    _ticks["n"] += 1
+    cs = [Contract("call", float(k), oi, 0.112)
+          for k, oi in {750: 4000, 760: 12000, 765: 30000}.items()]
+    cs += [Contract("put", float(k), oi, 0.118)
+           for k, oi in {745: 28000, 750: 33000}.items()]
+    return cs, 757.63 + _ticks["n"], date(2026, 8, 4)
+
+
+gex_engine.load_yfinance = _fake_chain
+try:
+    port = 8799
+    threading.Thread(target=lambda: gex_engine.run_server(["SPY"], 0, port, 3),
+                     daemon=True).start()
+    deadline = time.time() + 20
+    body = None
+    while time.time() < deadline:
+        try:
+            body = urllib.request.urlopen(f"http://127.0.0.1:{port}/api/levels",
+                                          timeout=2).read()
+            break
+        except Exception:
+            time.sleep(0.4)
+    check("server answers /api/levels", body is not None)
+    if body:
+        api = _json.loads(body)
+        check("api returns one symbol", len(api["levels"]) == 1)
+        check("api reports no error", api["error"] is None, str(api["error"]))
+        check("api is timestamped", bool(api["updated"]))
+        page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2).read().decode()
+        check("server serves the live page",
+              page.startswith("<!doctype html>") and "const LIVE = true" in page)
+        first = api["levels"][0]["spot"]
+        time.sleep(4)                                  # let one refresh land
+        api2 = _json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/levels", timeout=2).read())
+        check("levels actually refresh on the interval",
+              api2["levels"][0]["spot"] != first,
+              f"{first} → {api2['levels'][0]['spot']}")
+finally:
+    gex_engine.load_yfinance = _orig_loader
 
 # ---------------------------------------------------------------------------
 print()

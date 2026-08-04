@@ -3,11 +3,20 @@
 //  ITM GEX Levels + 0DTE Signal Engine
 //
 //  Draws dealer gamma-exposure levels (call wall / put wall / gamma flip /
-//  control node) as horizontal rays, infers the gamma regime from where price
-//  sits relative to the flip, and fires 5m buy/sell signals that combine
-//  momentum, volume/delta, liquidity events and level context.
+//  control node) as horizontal rays and infers the gamma regime from where
+//  price sits relative to the flip.
 //
-//  Levels come from tools/gex_engine.py (paste the blob into "GEX blob").
+//  Signals come from 15 confluences — trend, momentum, relative volume,
+//  cumulative delta, VWAP, liquidity sweeps, displacement, gamma-regime fit,
+//  the control-node magnet, room to the next level, the opening range, the
+//  expected-move band, higher-timeframe trend, market context and delta
+//  divergence. Each casts a weighted bull/bear vote; confidence is how strongly
+//  they agree, and a trade needs both a confident lean and a minimum number of
+//  confluences behind it. Entry, stop, TP1 and TP2 are drawn and tracked to
+//  their exit, with targets snapped to real GEX levels.
+//
+//  Levels come from tools/gex_engine.py (paste the blob into "GEX blob"), or
+//  run it with --serve for a live dashboard that refreshes through the session.
 //  With no blob the indicator falls back to auto levels derived from price,
 //  volume profile and VWAP so it still works on any symbol.
 // =============================================================================
@@ -50,21 +59,42 @@ i_sigOn    = input.bool(true, "Enable signals", group = G_SIG)
 i_rthOnly  = input.bool(true, "Regular hours only", group = G_SIG)
 i_skipOpen = input.int(2,  "Skip first N bars",  minval = 0, maxval = 12, group = G_SIG)
 i_skipEOD  = input.int(2,  "Skip last N bars",   minval = 0, maxval = 12, group = G_SIG)
-i_thresh   = input.float(0.34, "Signal threshold", minval = 0.05, maxval = 0.95, step = 0.01, group = G_SIG)
+i_minConf  = input.int(60, "Min confidence %", minval = 20, maxval = 95, step = 5, group = G_SIG,
+     tooltip = "Confidence is the weighted agreement across all confluences. 60 ≈ grade B.")
+i_minAgree = input.int(5, "Min confluences agreeing", minval = 2, maxval = 12, group = G_SIG)
 i_cooldown = input.int(5, "Cooldown bars", minval = 0, maxval = 50, group = G_SIG)
 i_regimeF  = input.bool(true, "Regime filter", group = G_SIG,
      tooltip = "In positive gamma, block longs pressed into the call wall and shorts pressed into the put wall (dealers suppress moves there).")
 
-w_mom = input.float(30, "Weight · momentum",  minval = 0, maxval = 100, group = G_SIG, inline = "w1")
-w_vol = input.float(25, "Weight · volume",    minval = 0, maxval = 100, group = G_SIG, inline = "w1")
-w_liq = input.float(25, "Weight · liquidity", minval = 0, maxval = 100, group = G_SIG, inline = "w2")
-w_lvl = input.float(20, "Weight · levels",    minval = 0, maxval = 100, group = G_SIG, inline = "w2")
+// ── Confluence weights ───────────────────────────────────────────────────────
+// Each confluence casts a bull/bear/neutral vote; confidence is the weighted
+// agreement between them. Set a weight to 0 to switch that confluence off.
+G_CONF = "4b · Confluence weights"
+w_trend  = input.float(12, "Trend (EMA stack)",      minval = 0, maxval = 30, group = G_CONF, inline = "a")
+w_mom    = input.float(10, "Momentum (RSI)",         minval = 0, maxval = 30, group = G_CONF, inline = "a")
+w_rvol   = input.float(8,  "Relative volume",        minval = 0, maxval = 30, group = G_CONF, inline = "b")
+w_delta  = input.float(10, "Cumulative delta",       minval = 0, maxval = 30, group = G_CONF, inline = "b")
+w_vwap   = input.float(8,  "VWAP position",          minval = 0, maxval = 30, group = G_CONF, inline = "c")
+w_sweep  = input.float(12, "Liquidity sweep",        minval = 0, maxval = 30, group = G_CONF, inline = "c")
+w_disp   = input.float(8,  "Displacement",           minval = 0, maxval = 30, group = G_CONF, inline = "d")
+w_gamma  = input.float(14, "Gamma regime fit",       minval = 0, maxval = 30, group = G_CONF, inline = "d")
+w_magnet = input.float(10, "Control-node magnet",    minval = 0, maxval = 30, group = G_CONF, inline = "e")
+w_room   = input.float(8,  "Room to next level",     minval = 0, maxval = 30, group = G_CONF, inline = "e")
+w_orb    = input.float(10, "Opening range",          minval = 0, maxval = 30, group = G_CONF, inline = "f")
+w_em     = input.float(10, "Expected-move band",     minval = 0, maxval = 30, group = G_CONF, inline = "f")
+w_htf    = input.float(12, "Higher timeframe trend", minval = 0, maxval = 30, group = G_CONF, inline = "g")
+w_ctx    = input.float(8,  "Market context (SPY)",   minval = 0, maxval = 30, group = G_CONF, inline = "g")
+w_div    = input.float(10, "Delta divergence",       minval = 0, maxval = 30, group = G_CONF, inline = "h")
+
+i_htf    = input.timeframe("15", "Higher timeframe", group = G_CONF)
+i_ctxSym = input.symbol("AMEX:SPY", "Context symbol", group = G_CONF)
 
 i_emaFast = input.int(9,  "EMA fast", minval = 2, group = G_SIG, inline = "m")
 i_emaSlow = input.int(21, "EMA slow", minval = 3, group = G_SIG, inline = "m")
 i_rvolLen = input.int(20, "RVOL length", minval = 5, group = G_SIG, inline = "v")
 i_cvdLen  = input.int(6,  "Delta slope bars", minval = 2, group = G_SIG, inline = "v")
 i_swing   = input.int(10, "Sweep lookback", minval = 3, group = G_SIG, inline = "l")
+i_orbMin  = input.int(30, "Opening range (min)", minval = 5, maxval = 120, step = 5, group = G_SIG, inline = "l")
 
 // ── Targets & risk ───────────────────────────────────────────────────────────
 i_minRR    = input.float(1.3, "Min reward:risk", minval = 0.2, step = 0.1, group = G_RISK)
@@ -83,7 +113,10 @@ i_showStats = input.bool(true, "Session stats table", group = G_RISK)
 // ── Display ──────────────────────────────────────────────────────────────────
 i_back = input.int(60, "Ray look-back bars", minval = 0, maxval = 500, group = G_UI)
 i_fwd  = input.int(18, "Ray extension bars", minval = 1, maxval = 200, group = G_UI)
-i_hud  = input.bool(true, "Show HUD", group = G_UI)
+i_hud       = input.bool(true, "Show HUD", group = G_UI)
+i_hudDetail = input.bool(false, "HUD · list active confluences", group = G_UI)
+i_minimal   = input.bool(false, "Minimal mode", group = G_UI,
+     tooltip = "Draws only the flip, the two main walls and the control node. Hides secondary walls, expected-move band, overnight levels, VWAP bands and the strike profile.")
 c_call = input.color(#2962ff, "Call wall / +GEX", group = G_UI, inline = "c1")
 c_put  = input.color(#ff2d3f, "Put wall / -GEX",  group = G_UI, inline = "c1")
 c_flip = input.color(#e8eaed, "Gamma flip",       group = G_UI, inline = "c2")
@@ -229,17 +262,26 @@ regime = not hasGex
 // =============================================================================
 //  Signal components  (each returns roughly -1 … +1)
 // =============================================================================
+// =============================================================================
+//  Confluence engine
+// =============================================================================
+// Fifteen independent reads on the tape. Each casts a bull / bear / neutral
+// vote and confidence is how strongly they agree once weighted, so a signal
+// needs both a confident lean and enough separate confluences behind it.
+
+// Session bar count — the opening range and the session filters both need it.
+var int rthBar = 0
+rthBar := inRth ? rthBar + 1 : 0
+tfMin    = math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
+rthTotal = math.round(390.0 / tfMin)
+
+f_clamp(float v) => math.max(-1.0, math.min(1.0, v))
+
+// ── Raw measures ─────────────────────────────────────────────────────────────
 emaF = ta.ema(close, i_emaFast)
 emaS = ta.ema(close, i_emaSlow)
 rsi  = ta.rsi(close, 14)
 
-f_clamp(float v) => math.max(-1.0, math.min(1.0, v))
-
-// 1 · Momentum — normalised EMA spread blended with RSI displacement
-momSpread = atr > 0 ? (emaF - emaS) / atr : 0.0
-momScore  = f_clamp(momSpread / 0.6) * 0.6 + f_clamp((rsi - 50) / 25) * 0.4
-
-// 2 · Volume — session cumulative delta slope, scaled by relative volume
 rng      = math.max(high - low, syminfo.mintick)
 barDelta = (2 * (close - low) / rng - 1) * volume
 var float cvd = 0.0
@@ -247,21 +289,46 @@ cvd := newDay ? barDelta : cvd + barDelta
 cvdSlope = cvd - cvd[i_cvdLen]
 cvdNorm  = ta.stdev(cvdSlope, 50)
 rvol     = volume / math.max(ta.sma(volume, i_rvolLen), 1)
-volScore = f_clamp(cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0) * f_clamp(0.45 + rvol / 2.2)
 
-// 3 · Liquidity — failed sweeps of prior swings, VWAP stretch, displacement
 swHi = ta.highest(high, i_swing)[1]
 swLo = ta.lowest(low, i_swing)[1]
-sweepHi = high > swHi and close < swHi          // ran stops above, closed back in → bearish
-sweepLo = low  < swLo and close > swLo          // ran stops below, closed back in → bullish
+sweepHi = high > swHi and close < swHi          // ran stops above, closed back in
+sweepLo = low  < swLo and close > swLo          // ran stops below, closed back in
 disp    = atr > 0 ? (close - open) / atr : 0.0
-stretch = atr > 0 ? (close - vwap) / math.max(vwapSd, atr * 0.5) : 0.0
-// Clamped so every component shares the same -1…+1 range and the configured
-// weights mean what they say.
-liqScore = f_clamp((sweepLo ? 0.7 : 0.0) - (sweepHi ? 0.7 : 0.0)
-     + f_clamp(disp / 1.2) * 0.4 - f_clamp(stretch / 2.5) * 0.3)
 
-// 4 · Levels — behaviour into the nearest wall, direction of the magnet
+// Opening range — the first N minutes frame the day for 0DTE.
+orbBars = math.max(1, int(math.round(i_orbMin / tfMin)))
+var float orbHi = na
+var float orbLo = na
+if newDay
+    orbHi := na
+    orbLo := na
+if inRth and rthBar <= orbBars
+    orbHi := na(orbHi) ? high : math.max(orbHi, high)
+    orbLo := na(orbLo) ? low  : math.min(orbLo, low)
+
+// Higher-timeframe trend, read from the *previous completed* HTF bar so the
+// vote never repaints while the current HTF candle is still forming.
+htfF = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_emaFast)[1],
+     lookahead = barmerge.lookahead_off)
+htfS = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_emaSlow)[1],
+     lookahead = barmerge.lookahead_off)
+
+// Market context. On a SPY chart this just echoes the VWAP confluence.
+ctxPx   = request.security(i_ctxSym, timeframe.period, close,
+     lookahead = barmerge.lookahead_off)
+ctxVwap = request.security(i_ctxSym, timeframe.period, ta.vwap(hlc3),
+     lookahead = barmerge.lookahead_off)
+
+// Delta divergence — price makes a new extreme, order flow does not follow.
+newPxHi  = close > ta.highest(close, 10)[1]
+newPxLo  = close < ta.lowest(close, 10)[1]
+newCvdHi = cvd   > ta.highest(cvd, 10)[1]
+newCvdLo = cvd   < ta.lowest(cvd, 10)[1]
+bearDiv  = newPxHi and not newCvdHi
+bullDiv  = newPxLo and not newCvdLo
+
+// ── Level context ────────────────────────────────────────────────────────────
 f_nearestAbove(float a, float b, float c, float d) =>
     float r = na
     if not na(a) and a > close
@@ -290,36 +357,85 @@ supLvl = f_nearestBelow(pwLvl, gexPW2, cnLvl, flipLvl)
 dRes   = na(resLvl) or atr <= 0 ? na : (resLvl - close) / atr
 dSup   = na(supLvl) or atr <= 0 ? na : (close - supLvl) / atr
 
-// Magnet pull toward the control node, strongest in positive gamma
-magnet    = na(cnLvl) ? na : cnLvl
+magnet     = na(cnLvl) ? na : cnLvl
 magnetPull = na(magnet) or atr <= 0 ? 0.0 : f_clamp((magnet - close) / (atr * 3))
 
-float lvlScore = 0.0
-if posGamma
-    // Fade the edges, respect the pin.
-    lvlScore := magnetPull * 0.6
-    lvlScore += (not na(dRes) and dRes < 0.6 ? -0.4 : 0.0)
-    lvlScore += (not na(dSup) and dSup < 0.6 ?  0.4 : 0.0)
-else if negGamma
-    // Acceptance through a level tends to extend rather than revert.
-    brokeUp = not na(resLvl) and close > resLvl and close[1] <= resLvl
-    brokeDn = not na(supLvl) and close < supLvl and close[1] >= supLvl
-    lvlScore := (brokeUp ? 0.7 : 0.0) - (brokeDn ? 0.7 : 0.0) + magnetPull * 0.25
-else
-    lvlScore := magnetPull * 0.4
+// ── Voting ───────────────────────────────────────────────────────────────────
+cNames = array.new<string>()
+cVotes = array.new<float>()
+cWts   = array.new<float>()
 
-wSum  = math.max(w_mom + w_vol + w_liq + w_lvl, 1)
-score = (momScore * w_mom + volScore * w_vol + liqScore * w_liq + lvlScore * w_lvl) / wSum
+f_vote(string[] nmA, float[] vA, float[] wA, string nm, float v, float w) =>
+    if w > 0 and not na(v)
+        array.push(nmA, nm)
+        array.push(vA, math.max(-1.0, math.min(1.0, v)))
+        array.push(wA, w)
+
+// 1 trend, 2 momentum
+f_vote(cNames, cVotes, cWts, "Trend", atr > 0 ? (emaF - emaS) / (atr * 0.6) : 0.0, w_trend)
+f_vote(cNames, cVotes, cWts, "Momentum", (rsi - 50) / 20.0, w_mom)
+// 3 participation confirms the bar's own direction
+f_vote(cNames, cVotes, cWts, "RVOL",
+     rvol > 1.15 ? (close > open ? 1.0 : -1.0) * math.min((rvol - 1.0) / 1.5, 1.0) : 0.0, w_rvol)
+// 4 order flow
+f_vote(cNames, cVotes, cWts, "Delta", cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0, w_delta)
+// 5 value area
+f_vote(cNames, cVotes, cWts, "VWAP", atr > 0 ? (close - vwap) / (atr * 1.2) : 0.0, w_vwap)
+// 6 a failed sweep is the highest-quality single tell on this list
+f_vote(cNames, cVotes, cWts, "Sweep", sweepLo ? 1.0 : sweepHi ? -1.0 : 0.0, w_sweep)
+// 7 conviction of the current bar
+f_vote(cNames, cVotes, cWts, "Displacement", disp / 1.2, w_disp)
+// 8 regime bias: short gamma amplifies the prevailing move, long gamma pulls to the node
+f_vote(cNames, cVotes, cWts, "Gamma fit",
+     negGamma and atr > 0 ? f_clamp((close - vwap) / (atr * 1.5))
+     : posGamma ? magnetPull : 0.0, w_gamma)
+// 9 the magnet itself
+f_vote(cNames, cVotes, cWts, "Magnet", magnetPull, w_magnet)
+// 10 asymmetry of space — far ceiling and near floor favours longs
+f_vote(cNames, cVotes, cWts, "Room", (nz(dRes, 3.0) - nz(dSup, 3.0)) / 2.0, w_room)
+// 11 opening range
+f_vote(cNames, cVotes, cWts, "Opening range",
+     na(orbHi) or na(orbLo) ? 0.0 : close > orbHi ? 1.0 : close < orbLo ? -1.0 : 0.0, w_orb)
+// 12 expected-move exhaustion — the edges of the band tend to reject on 0DTE
+f_vote(cNames, cVotes, cWts, "EM band",
+     not na(emUp) and close >= emUp ? -1.0 : not na(emDn) and close <= emDn ? 1.0 : 0.0, w_em)
+// 13 higher timeframe
+f_vote(cNames, cVotes, cWts, "HTF trend",
+     na(htfF) or na(htfS) or atr <= 0 ? 0.0 : (htfF - htfS) / (atr * 0.8), w_htf)
+// 14 broad market
+f_vote(cNames, cVotes, cWts, "Context",
+     na(ctxPx) or na(ctxVwap) ? 0.0 : ctxPx > ctxVwap ? 0.6 : -0.6, w_ctx)
+// 15 divergence
+f_vote(cNames, cVotes, cWts, "Divergence", bullDiv ? 1.0 : bearDiv ? -1.0 : 0.0, w_div)
+
+// ── Tally ────────────────────────────────────────────────────────────────────
+float bullW = 0.0
+float bearW = 0.0
+float totW  = 0.0
+int   nBull = 0
+int   nBear = 0
+if array.size(cVotes) > 0
+    for i = 0 to array.size(cVotes) - 1
+        v = array.get(cVotes, i)
+        w = array.get(cWts, i)
+        totW += w
+        if v > 0.15
+            bullW += w * v
+            nBull += 1
+        else if v < -0.15
+            bearW += w * (-v)
+            nBear += 1
+
+// score keeps the -1…+1 convention the rest of the script uses
+score      = totW > 0 ? (bullW - bearW) / totW : 0.0
+confidence = math.round(math.abs(score) * 100)
+nAgree     = score > 0 ? nBull : nBear
+grade      = confidence >= 75 ? "A" : confidence >= 60 ? "B" : confidence >= 45 ? "C" : "D"
+thrScore   = i_minConf / 100.0
 
 // =============================================================================
 //  Signal gating
 // =============================================================================
-// Count bars elapsed in the regular session so the open/close windows can be
-// skipped in bar terms rather than against a hard-coded clock.
-var int rthBar = 0
-rthBar := inRth ? rthBar + 1 : 0
-tfMin    = math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
-rthTotal = math.round(390.0 / tfMin)
 
 sessionOk = not i_rthOnly or inRth
 openOk    = inRth ? rthBar > i_skipOpen : not i_rthOnly
@@ -416,8 +532,12 @@ var int lastSig = -1000
 canFire = i_sigOn and sessionOk and openOk and eodOk and barstate.isconfirmed
      and (bar_index - lastSig) > i_cooldown and not pinned
 
-buySig  = canFire and score >=  i_thresh and longRR  >= i_minRR and not blockLong
-sellSig = canFire and score <= -i_thresh and shortRR >= i_minRR and not blockShort
+// A trade needs a confident lean AND enough separate confluences behind it —
+// one dominant weight shouldn't be able to carry a signal on its own.
+buySig  = canFire and score > 0 and confidence >= i_minConf and nAgree >= i_minAgree
+     and longRR >= i_minRR and not blockLong
+sellSig = canFire and score < 0 and confidence >= i_minConf and nAgree >= i_minAgree
+     and shortRR >= i_minRR and not blockShort
 
 if buySig or sellSig
     lastSig := bar_index
@@ -490,7 +610,7 @@ if tDir != 0 and not openLong and not openShort
             if i_beAtTp1
                 tStop := tEntry          // risk removed, let TP2 run
         if i_exitFlip and barstate.isconfirmed
-             and ((isLong and score <= -i_thresh) or (not isLong and score >= i_thresh))
+             and ((isLong and score <= -thrScore) or (not isLong and score >= thrScore))
             exitReason := "FLIP"
             exitPrice := close
         // 0DTE contracts decay to nothing overnight — never hold past the close.
@@ -529,26 +649,26 @@ f_ray(float price, color col, int width, bool show, string txt) =>
 f_ray(flipLvl, c_flip, 2, i_showFlip and not na(flipLvl), hasGex ? "FLIP" : "VWAP")
 f_ray(cwLvl,   c_call, 3, i_showWall and not na(cwLvl),   hasGex ? "CALL WALL" : "PDH")
 f_ray(pwLvl,   c_put,  3, i_showWall and not na(pwLvl),   hasGex ? "PUT WALL"  : "PDL")
-f_ray(gexCW2,  c_call, 1, i_showWall and not na(gexCW2),  "CALL W2")
-f_ray(gexPW2,  c_put,  1, i_showWall and not na(gexPW2),  "PUT W2")
+f_ray(gexCW2,  c_call, 1, i_showWall and not i_minimal and not na(gexCW2),  "CALL W2")
+f_ray(gexPW2,  c_put,  1, i_showWall and not i_minimal and not na(gexPW2),  "PUT W2")
 f_ray(cnLvl,   c_node, 2, i_showNode and not na(cnLvl),   hasGex ? "CONTROL NODE" : "POC")
 
-f_ray(emUp, color.new(c_call, 40), 1, i_showEM and not na(emUp), "EM +")
-f_ray(emDn, color.new(c_put,  40), 1, i_showEM and not na(emDn), "EM −")
+f_ray(emUp, color.new(c_call, 40), 1, i_showEM and not i_minimal and not na(emUp), "EM +")
+f_ray(emDn, color.new(c_put,  40), 1, i_showEM and not i_minimal and not na(emDn), "EM −")
 
 // Auto extras
 f_ray(pdh,  color.new(color.gray, 20), 1, i_showPDHL and not hasGex and not na(pdh), "PDH")
 f_ray(pdl,  color.new(color.gray, 20), 1, i_showPDHL and not hasGex and not na(pdl), "PDL")
-f_ray(onh,  color.new(color.teal, 20), 1, i_showONHL and not na(onh), "ONH")
-f_ray(onl,  color.new(color.teal, 20), 1, i_showONHL and not na(onl), "ONL")
+f_ray(onh,  color.new(color.teal, 20), 1, i_showONHL and not i_minimal and not na(onh), "ONH")
+f_ray(onl,  color.new(color.teal, 20), 1, i_showONHL and not i_minimal and not na(onl), "ONL")
 
 plot(i_showVWAP ? vwap : na, "VWAP", color.new(color.orange, 20), 1)
-plot(i_showVWAP ? vwap + vwapSd : na, "VWAP +1σ", color.new(color.orange, 70), 1)
-plot(i_showVWAP ? vwap - vwapSd : na, "VWAP −1σ", color.new(color.orange, 70), 1)
+plot(i_showVWAP and not i_minimal ? vwap + vwapSd : na, "VWAP +1σ", color.new(color.orange, 70), 1)
+plot(i_showVWAP and not i_minimal ? vwap - vwapSd : na, "VWAP −1σ", color.new(color.orange, 70), 1)
 
 // Per-strike profile rays, width scaled by |GEX| — the panel from the screenshot
 var line[] profLines = array.new<line>()
-if barstate.islast and i_profShow and array.size(pStrike) > 0
+if barstate.islast and i_profShow and not i_minimal and array.size(pStrike) > 0
     if array.size(profLines) > 0
         for i = 0 to array.size(profLines) - 1
             line.delete(array.get(profLines, i))
@@ -666,47 +786,77 @@ if not na(exitReason)
     tTp1Hit := false
 
 // =============================================================================
-//  HUD
+//  HUD — one compact card: what the confluences say, and where price can go
 // =============================================================================
-f_bar(float v) =>
-    int n = int(math.round(math.abs(v) * 5))
+f_meter(int pct) =>
+    int filled = int(math.round(pct / 10.0))
     string s = ""
-    if n > 0
-        for i = 1 to n
-            s := s + "█"
-    (v >= 0 ? "+" : "−") + s
+    for i = 1 to 10
+        s := s + (i <= filled ? "█" : "░")
+    s
+
+// The confluences currently voting, strongest first is not worth a sort here —
+// declaration order already runs roughly most- to least-structural.
+f_confList() =>
+    string s = ""
+    int shown = 0
+    if array.size(cVotes) > 0
+        for i = 0 to array.size(cVotes) - 1
+            v = array.get(cVotes, i)
+            if math.abs(v) > 0.15 and shown < 8
+                s := s + (v > 0 ? "▲ " : "▼ ") + array.get(cNames, i) + "\n"
+                shown += 1
+    s == "" ? "no confluence active" : str.substring(s, 0, str.length(s) - 1)
 
 if i_hud and barstate.islast
-    var table t = table.new(position.top_right, 2, 9, border_width = 1)
-    table.cell(t, 0, 0, "SOURCE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 0, hasGex ? "GEX blob loaded" : "AUTO — paste GEX blob",
-         text_color = hasGex ? c_node : color.gray, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 1, "REGIME", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 1, regime, text_color = not hasGex ? color.gray : posGamma ? c_call : c_put,
-         text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 2, "SCORE", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 2, str.tostring(score, "#.##") + "  " + f_bar(score),
-         text_color = score > 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 3, "mom / vol", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 3, str.tostring(momScore, "#.##") + " / " + str.tostring(volScore, "#.##"),
-         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 4, "liq / lvl", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 4, str.tostring(liqScore, "#.##") + " / " + str.tostring(lvlScore, "#.##"),
-         text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 5, "RVOL", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 5, str.tostring(rvol, "#.##") + "×",
-         text_color = rvol > 1.5 ? #ffd54a : color.silver, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 6, "MAGNET", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 6, na(magnet) ? "—" : str.tostring(magnet, format.mintick) +
-         "  " + (magnetPull > 0.05 ? "↑" : magnetPull < -0.05 ? "↓" : "•"),
-         text_color = c_node, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 7, "PATH ↑", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 7, na(resLvl) ? "—" : str.tostring(resLvl, format.mintick) +
-         "  (" + str.tostring(dRes, "#.#") + " ATR)", text_color = c_call, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(t, 0, 8, "PATH ↓", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(t, 1, 8, na(supLvl) ? "—" : str.tostring(supLvl, format.mintick) +
-         "  (" + str.tostring(dSup, "#.#") + " ATR)", text_color = c_put, text_size = size.tiny, text_halign = text.align_right)
+    waiting = confidence < i_minConf or nAgree < i_minAgree
+    dirTxt  = waiting ? "◆  WAIT" : score > 0 ? "▲  LONG BIAS" : "▼  SHORT BIAS"
+    dirCol  = waiting ? color.gray : score > 0 ? C_WIN : C_LOSS
 
+    int rows = i_hudDetail ? 7 : 6
+    var table t = table.new(position.top_right, 1, 7, border_width = 0,
+         frame_color = color.new(color.gray, 60), frame_width = 1)
+
+    // headline: direction + confidence
+    table.cell(t, 0, 0, dirTxt + "     " + str.tostring(confidence) + "%",
+         text_color = waiting ? color.silver : color.black,
+         bgcolor = color.new(dirCol, waiting ? 80 : 10),
+         text_size = size.normal, text_halign = text.align_left)
+
+    // confidence meter + grade
+    table.cell(t, 0, 1, f_meter(confidence) + "   " + grade + " · " +
+         str.tostring(nAgree) + "/" + str.tostring(array.size(cVotes)) + " agree",
+         text_color = dirCol, bgcolor = color.new(color.black, 85),
+         text_size = size.small, text_halign = text.align_left)
+
+    // regime
+    table.cell(t, 0, 2, regime,
+         text_color = not hasGex ? color.gray : posGamma ? c_call : c_put,
+         bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_left)
+
+    // the path: nearest level each way
+    table.cell(t, 0, 3,
+         "↑ " + (na(resLvl) ? "—" : str.tostring(resLvl, format.mintick)) +
+         "     ↓ " + (na(supLvl) ? "—" : str.tostring(supLvl, format.mintick)),
+         text_color = color.silver, bgcolor = color.new(color.black, 85),
+         text_size = size.tiny, text_halign = text.align_left)
+
+    // magnet
+    table.cell(t, 0, 4,
+         "magnet " + (na(magnet) ? "—" : str.tostring(magnet, format.mintick)) +
+         "  " + (magnetPull > 0.05 ? "↑" : magnetPull < -0.05 ? "↓" : "•") +
+         "     rvol " + str.tostring(rvol, "#.#") + "×",
+         text_color = c_node, bgcolor = color.new(color.black, 85),
+         text_size = size.tiny, text_halign = text.align_left)
+
+    // data source — states outright whether real GEX is loaded
+    table.cell(t, 0, 5, hasGex ? "● GEX levels loaded" : "○ auto levels — no GEX blob",
+         text_color = hasGex ? c_node : color.gray, bgcolor = color.new(color.black, 85),
+         text_size = size.tiny, text_halign = text.align_left)
+
+    table.cell(t, 0, 6, i_hudDetail ? f_confList() : "",
+         text_color = color.silver, bgcolor = color.new(color.black, i_hudDetail ? 85 : 100),
+         text_size = size.tiny, text_halign = text.align_left)
 // Session scorecard — today's closed trades only, reset each day.
 if i_showStats and i_manageOn and barstate.islast
     var table st = table.new(position.bottom_right, 2, 4, border_width = 1)

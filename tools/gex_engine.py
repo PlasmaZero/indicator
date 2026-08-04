@@ -309,6 +309,82 @@ def print_report(lv: Levels) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live server
+# ---------------------------------------------------------------------------
+def run_server(symbols: list[str], dte: int, port: int, interval: int) -> None:
+    """
+    Serve a self-refreshing dashboard. A background thread re-pulls the chains
+    on `interval`; the page polls /api/levels and repaints without a reload, so
+    the levels track the session instead of freezing at whatever the open was.
+    """
+    import http.server
+    import json as _json
+    import threading
+    import time
+
+    from dashboard import render_dashboard, payload_for
+
+    state: dict = {"levels": [], "updated": "", "error": None}
+    ready = threading.Event()
+
+    def refresh_loop():
+        while True:
+            try:
+                out = []
+                for sym in symbols:
+                    contracts, spot, expiry = load_yfinance(sym, dte)
+                    out.append(derive_levels(sym, expiry, contracts, spot))
+                state["levels"] = out
+                state["updated"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                state["error"] = None
+                print(f"[{state['updated']}] refreshed {', '.join(symbols)}")
+            except Exception as exc:                      # keep serving stale data
+                state["error"] = str(exc)
+                print(f"refresh failed: {exc}", file=sys.stderr)
+            ready.set()
+            time.sleep(interval)
+
+    threading.Thread(target=refresh_loop, daemon=True).start()
+    print("fetching first snapshot…")
+    ready.wait(timeout=90)
+    if not state["levels"]:
+        sys.exit(f"could not load any chain: {state['error']}")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, body: bytes, ctype: str):
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/api/levels"):
+                body = _json.dumps({
+                    "levels": payload_for(state["levels"]),
+                    "updated": state["updated"],
+                    "error": state["error"],
+                }).encode()
+                self._send(body, "application/json")
+            else:
+                html = render_dashboard(state["levels"], live=True,
+                                        poll_ms=max(interval, 5) * 1000)
+                self._send(html.encode(), "text/html; charset=utf-8")
+
+        def log_message(self, *args):
+            pass                                          # quiet; we log refreshes
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"\n  live dashboard → http://127.0.0.1:{port}")
+    print(f"  refreshing every {interval}s · ctrl-c to stop\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -322,9 +398,21 @@ def main() -> None:
     ap.add_argument("--expiry", help="YYYY-MM-DD when --source csv")
     ap.add_argument("--json", help="write levels JSON here")
     ap.add_argument("--html", help="write dashboard HTML here")
+    ap.add_argument("--serve", action="store_true",
+                    help="run a live auto-refreshing dashboard instead of a one-shot report")
+    ap.add_argument("--port", type=int, default=8787, help="port for --serve")
+    ap.add_argument("--interval", type=int, default=60,
+                    help="seconds between chain refreshes when serving")
     args = ap.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    if args.serve:
+        if args.source == "csv":
+            sys.exit("--serve needs a live source; drop --source csv")
+        run_server(symbols, args.dte, args.port, max(15, args.interval))
+        return
+
     results: list[Levels] = []
 
     for sym in symbols:

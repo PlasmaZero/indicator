@@ -76,24 +76,53 @@ volume-profile point of control as the magnet) and keeps working on any symbol.
 
 ---
 
-## How signals are scored
+## Confluences and confidence
 
-Four components, each normalised to −1…+1, combined with configurable weights.
-A signal fires when the composite crosses the threshold **and** the reward:risk
-to the next level clears the minimum.
+Fifteen independent reads on the tape. Each casts a weighted bull / bear /
+neutral vote, and **confidence** is how strongly they agree:
 
-| Component | Default weight | What it measures |
-|---|---|---|
-| **Momentum** | 30 | EMA(9/21) spread in ATR units, blended with RSI displacement |
-| **Volume** | 25 | Session cumulative delta slope, scaled by relative volume |
-| **Liquidity** | 25 | Failed sweeps of prior swings, bar displacement, VWAP stretch |
-| **Levels** | 20 | Behaviour into the nearest wall + pull toward the control node |
+```
+confidence = |bullWeight − bearWeight| / totalWeight × 100
+```
 
-The **levels** component is regime-aware and is where GEX earns its keep:
+| # | Confluence | Wt | What it reads |
+|---|---|---|---|
+| 1 | Trend | 12 | EMA(9/21) spread in ATR units |
+| 2 | Momentum | 10 | RSI displacement from 50 |
+| 3 | Relative volume | 8 | Participation confirming the bar's direction |
+| 4 | Cumulative delta | 10 | Session order-flow slope |
+| 5 | VWAP | 8 | Distance from the session's value anchor |
+| 6 | Liquidity sweep | 12 | Failed break of a prior swing — the best single tell here |
+| 7 | Displacement | 8 | Conviction of the current bar |
+| 8 | Gamma-regime fit | 14 | Short gamma amplifies the move; long gamma pulls to the node |
+| 9 | Control-node magnet | 10 | Direction and strength of the pin |
+| 10 | Room to next level | 8 | Asymmetry of space — far ceiling, near floor favours longs |
+| 11 | Opening range | 10 | Above/below the first 30 minutes |
+| 12 | Expected-move band | 10 | Exhaustion at the edges of the day's priced range |
+| 13 | Higher timeframe | 12 | 15m trend, read from the last *completed* HTF bar |
+| 14 | Market context | 8 | SPY above/below its VWAP as a breadth proxy |
+| 15 | Delta divergence | 10 | New price extreme that order flow doesn't confirm |
 
-- *Positive gamma* — scores the pull toward the control node, penalises longs
-  pressed into the call wall and shorts pressed into the put wall.
-- *Negative gamma* — rewards acceptance **through** a level, since in short-gamma
+A signal needs **three** things, not one:
+
+1. Confidence ≥ your minimum (default 60%)
+2. At least N separate confluences agreeing (default 5) — so no single heavy
+   weight can carry a trade alone
+3. Reward:risk to the first target ≥ your minimum
+
+Confidence maps to a grade: **A** ≥ 75, **B** ≥ 60, **C** ≥ 45, **D** below.
+Set any weight to **0** to switch that confluence off.
+
+The HUD shows the direction, confidence with a meter, the grade, how many
+confluences agree, the regime, the path each way and whether real GEX is
+loaded. Turn on *HUD · list active confluences* to see exactly which ones are
+voting and which way.
+
+The **gamma-regime fit** confluence is where GEX earns its keep:
+
+- *Positive gamma* — biases toward the control node, and the regime filter
+  blocks longs pressed into the call wall and shorts into the put wall.
+- *Negative gamma* — biases with the prevailing move, since in short-gamma
   conditions a break tends to extend rather than revert.
 
 A **regime filter** (on by default) additionally blocks longs within 0.4 ATR of
@@ -172,11 +201,40 @@ an OI wall into `cw2`/`pw2` if you want it drawn too.
 ## The dashboard
 
 `--html dashboard.html` writes a standalone page (no external requests) with the
-GEX-by-strike profile, spot and flip marked, stat tiles for every level, and the
-Pine blobs ready to copy. A sample built from the test fixture lives at
+GEX-by-strike profile, spot and flip marked, headline tiles and the Pine blobs
+ready to copy. A sample built from the test fixture lives at
 `docs/sample_dashboard.html`.
 
+### Live mode
+
+```bash
+python3 gex_engine.py --symbols SPY,QQQ,IWM,TSLA,NVDA --dte 0 --serve
+```
+
+Opens `http://127.0.0.1:8787`. A background thread re-pulls the chains every
+60s (`--interval`) and the page polls and repaints in place, so your open tab
+and scroll position survive each update — the levels track the session instead
+of freezing at whatever the open was. A pulsing **LIVE** badge shows the last
+refresh; it goes grey if a refresh fails, and the last good data stays on
+screen rather than blanking.
+
+This is the closest thing to real-time GEX available here. **TradingView
+itself cannot pull it** — Pine has no way to fetch an options chain, so the
+chart levels are only as fresh as your last paste. Keep the live dashboard on
+a second monitor and re-paste the blob when the levels have moved
+meaningfully; on a busy 0DTE session that's usually once around midday.
+
+What *is* genuinely real-time on the chart: the higher-timeframe trend and the
+market-context confluences, both pulled live via `request.security`.
+
 ---
+
+## Keeping the chart readable
+
+Turn on **Minimal mode** (Display group) to draw only the flip, the two main
+walls and the control node — it hides secondary walls, the expected-move band,
+overnight levels, VWAP bands and the strike profile. Worth switching on once
+you know what the levels mean.
 
 ## Bringing your own chain
 
