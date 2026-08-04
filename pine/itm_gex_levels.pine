@@ -59,6 +59,9 @@ i_sigOn    = input.bool(true, "Enable signals", group = G_SIG)
 i_rthOnly  = input.bool(true, "Regular hours only", group = G_SIG)
 i_skipOpen = input.int(2,  "Skip first N bars",  minval = 0, maxval = 12, group = G_SIG)
 i_skipEOD  = input.int(2,  "Skip last N bars",   minval = 0, maxval = 12, group = G_SIG)
+i_preset   = input.string("Balanced", "Signal frequency",
+     options = ["Conservative", "Balanced", "Aggressive", "Custom"], group = G_SIG,
+     tooltip = "Presets move the four gates together. Aggressive fires several times more often and takes weaker setups. Custom uses the fields below verbatim.")
 i_minConf  = input.int(60, "Min confidence %", minval = 20, maxval = 95, step = 5, group = G_SIG,
      tooltip = "Confidence is the weighted agreement across all confluences. 60 ≈ grade B.")
 i_minAgree = input.int(5, "Min confluences agreeing", minval = 2, maxval = 12, group = G_SIG)
@@ -108,7 +111,20 @@ i_exitFlip = input.bool(false, "Exit if score flips against the trade", group = 
 i_pinGuard = input.bool(true, "Block new entries pinned to the control node", group = G_RISK,
      tooltip = "Late in the session in positive gamma, price parked on the control node tends to stay there. Suppresses low-quality entries.")
 i_drawProj = input.bool(true, "Draw target projection", group = G_RISK)
+i_liteDraw  = input.bool(false, "Lite trade drawing", group = G_RISK,
+     tooltip = "Draws the entry line and labels only, dropping the zone boxes and target lines. Roughly doubles how many past trades stay on the chart before TradingView starts dropping the oldest.")
 i_showStats = input.bool(true, "Session stats table", group = G_RISK)
+
+// Preset resolution. Everything downstream reads these, not the raw inputs, so
+// switching preset moves all four gates together.
+minConf  = i_preset == "Custom" ? i_minConf
+     : i_preset == "Conservative" ? 70 : i_preset == "Balanced" ? 60 : 45
+minAgree = i_preset == "Custom" ? i_minAgree
+     : i_preset == "Conservative" ? 6 : i_preset == "Balanced" ? 5 : 3
+coolBars = i_preset == "Custom" ? i_cooldown
+     : i_preset == "Conservative" ? 8 : i_preset == "Balanced" ? 5 : 2
+minRR    = i_preset == "Custom" ? i_minRR
+     : i_preset == "Conservative" ? 1.6 : i_preset == "Balanced" ? 1.3 : 1.0
 
 // ── Display ──────────────────────────────────────────────────────────────────
 i_back = input.int(60, "Ray look-back bars", minval = 0, maxval = 500, group = G_UI)
@@ -220,27 +236,27 @@ if not inRth
 
 // Session volume profile → point of control (auto "control node")
 var map<int, float> vp = map.new<int, float>()
-var float bkt = na
+var float bkt    = na
+var float pocVol = 0.0
+var float pocPx  = na
 if newDay or na(bkt)
     map.clear(vp)
+    pocVol := 0.0
+    pocPx  := na
     bkt := math.max(syminfo.mintick, math.round(nz(atr, close * 0.002) * 0.15 / syminfo.mintick) * syminfo.mintick)
 int vpKey = int(math.round(hlc3 / bkt))
-map.put(vp, vpKey, nz(map.get(vp, vpKey)) + volume)
+float bucketVol = nz(map.get(vp, vpKey)) + volume
+map.put(vp, vpKey, bucketVol)
 
-f_poc() =>
-    float best = na
-    float bestV = 0.0
-    ks = map.keys(vp)
-    // `for 0 to size-1` would count downward on an empty map and index out of range
-    if array.size(ks) > 0
-        for i = 0 to array.size(ks) - 1
-            k = array.get(ks, i)
-            v = nz(map.get(vp, k))
-            if v > bestV
-                bestV := v
-                best := k * bkt
-    best
-poc = barstate.islast ? f_poc() : na
+// The POC is tracked incrementally rather than by scanning the map. Scanning
+// was only affordable on the last bar, which left `poc` na across all history —
+// so in auto mode historical signals were scored without the magnet confluence
+// and without a control-node target, while live ones had both. Same maths on
+// every bar now, and it is O(1) per bar instead of O(buckets).
+if bucketVol > pocVol
+    pocVol := bucketVol
+    pocPx  := vpKey * bkt
+poc = pocPx
 
 // Effective levels: GEX when supplied, otherwise auto proxies
 flipLvl = hasGex ? gexFlip : (i_autoOn ? vwap : na)
@@ -457,7 +473,7 @@ score      = totW > 0 ? (bullW - bearW) / totW : 0.0
 confidence = math.round(math.abs(score) * 100)
 nAgree     = score > 0 ? nBull : nBear
 grade      = confidence >= 75 ? "A" : confidence >= 60 ? "B" : confidence >= 45 ? "C" : "D"
-thrScore   = i_minConf / 100.0
+thrScore   = minConf / 100.0
 
 // =============================================================================
 //  Signal gating
@@ -564,14 +580,14 @@ pinned = i_pinGuard and posGamma and hasGex and lateSession
 
 var int lastSig = -1000
 canFire = i_sigOn and sessionOk and openOk and eodOk and barstate.isconfirmed
-     and (bar_index - lastSig) > i_cooldown and not pinned
+     and (bar_index - lastSig) > coolBars and not pinned
 
 // A trade needs a confident lean AND enough separate confluences behind it —
 // one dominant weight shouldn't be able to carry a signal on its own.
-buySig  = canFire and score > 0 and confidence >= i_minConf and nAgree >= i_minAgree
-     and longRR >= i_minRR and not blockLong
-sellSig = canFire and score < 0 and confidence >= i_minConf and nAgree >= i_minAgree
-     and shortRR >= i_minRR and not blockShort
+buySig  = canFire and score > 0 and confidence >= minConf and nAgree >= minAgree
+     and longRR >= minRR and not blockLong
+sellSig = canFire and score < 0 and confidence >= minConf and nAgree >= minAgree
+     and shortRR >= minRR and not blockShort
 
 if buySig or sellSig
     lastSig := bar_index
@@ -853,14 +869,14 @@ f_sigText(bool isLong, float tgt, float stp, float rr) =>
      "\nR " + str.tostring(rr, "#.##") + "  · " + (posGamma ? "γ+" : negGamma ? "γ−" : "γ?") +
      "  RVOL " + str.tostring(rvol, "#.#")
 
-if buySig
+if buySig and not i_manageOn
     label.new(bar_index, low, f_sigText(true, longTgt, longStop, longRR),
          style = label.style_label_up, color = color.new(#00e676, 20),
          textcolor = color.black, size = size.small)
     if i_drawProj and not i_manageOn
         line.new(bar_index, close, bar_index + i_fwd, longTgt,
              color = color.new(#00e676, 30), width = 1, style = line.style_dashed)
-if sellSig
+if sellSig and not i_manageOn
     label.new(bar_index, high, f_sigText(false, shortTgt, shortStop, shortRR),
          style = label.style_label_down, color = color.new(#ff1744, 20),
          textcolor = color.white, size = size.small)
@@ -887,40 +903,53 @@ if openLong or openShort
     rBot = isLong ? tStop  : tEntry
     wTop = isLong ? tTp1   : tEntry
     wBot = isLong ? tEntry : tTp1
-    bRisk := box.new(bar_index, rTop, bar_index + 2, rBot,
-         border_color = color.new(C_LOSS, 55), bgcolor = color.new(C_LOSS, 88))
-    bRew := box.new(bar_index, wTop, bar_index + 2, wBot,
-         border_color = color.new(C_WIN, 55), bgcolor = color.new(C_WIN, 88))
+    // Each trade permanently costs 2 boxes + 4 lines + 2 labels of the 500-object
+    // budget, and lines bind first at roughly 110 trades of visible history.
+    // Lite mode keeps only the entry line, which more than doubles that.
+    if not i_liteDraw
+        bRisk := box.new(bar_index, rTop, bar_index + 2, rBot,
+             border_color = color.new(C_LOSS, 55), bgcolor = color.new(C_LOSS, 88))
+        bRew := box.new(bar_index, wTop, bar_index + 2, wBot,
+             border_color = color.new(C_WIN, 55), bgcolor = color.new(C_WIN, 88))
+        lStop := line.new(bar_index, tStop, bar_index + 2, tStop,
+             color = C_LOSS, width = 1, style = line.style_dashed)
+        lTp1 := line.new(bar_index, tTp1, bar_index + 2, tTp1, color = C_WIN, width = 1)
+        lTp2 := line.new(bar_index, tTp2, bar_index + 2, tTp2,
+             color = color.new(C_WIN, 40), width = 1, style = line.style_dotted)
     lEntry := line.new(bar_index, tEntry, bar_index + 2, tEntry,
          color = color.new(color.white, 20), width = 2)
-    lStop := line.new(bar_index, tStop, bar_index + 2, tStop,
-         color = C_LOSS, width = 1, style = line.style_dashed)
-    lTp1 := line.new(bar_index, tTp1, bar_index + 2, tTp1, color = C_WIN, width = 1)
-    lTp2 := line.new(bar_index, tTp2, bar_index + 2, tTp2,
-         color = color.new(C_WIN, 40), width = 1, style = line.style_dotted)
     label.new(bar_index, tEntry,
          (isLong ? "▲ LONG " : "▼ SHORT ") + str.tostring(tEntry, format.mintick) +
+         "   " + str.tostring(confidence) + "% " + grade +
          "\nstop " + str.tostring(tStop, format.mintick) +
          "\ntp1 "  + str.tostring(tTp1, format.mintick) +
          "  (" + str.tostring(math.abs(tTp1 - tEntry) / tRisk, "#.#") + "R)" +
-         "\ntp2 "  + str.tostring(tTp2, format.mintick),
+         "\ntp2 "  + str.tostring(tTp2, format.mintick) +
+         "\n" + (posGamma ? "γ+" : negGamma ? "γ−" : "γ?") +
+         " · " + str.tostring(nAgree) + " agree · RVOL " + str.tostring(rvol, "#.#"),
          style = isLong ? label.style_label_upper_right : label.style_label_lower_right,
          color = color.new(isLong ? C_WIN : C_LOSS, 15),
          textcolor = isLong ? color.black : color.white, size = size.small)
 
 // Stretch the live trade's drawings to the current bar.
-if tDir != 0 and not na(bRisk)
-    box.set_right(bRisk, bar_index + 2)
-    box.set_right(bRew, bar_index + 2)
-    line.set_x2(lEntry, bar_index + 2)
-    line.set_x2(lStop, bar_index + 2)
-    line.set_x2(lTp1, bar_index + 2)
-    line.set_x2(lTp2, bar_index + 2)
-    // the stop line follows a breakeven move
-    line.set_y1(lStop, tStop)
-    line.set_y2(lStop, tStop)
-    if tTp1Hit
-        line.set_color(lStop, color.new(color.gray, 30))
+if tDir != 0
+    if not na(bRisk)
+        box.set_right(bRisk, bar_index + 2)
+    if not na(bRew)
+        box.set_right(bRew, bar_index + 2)
+    if not na(lEntry)
+        line.set_x2(lEntry, bar_index + 2)
+    if not na(lTp1)
+        line.set_x2(lTp1, bar_index + 2)
+    if not na(lTp2)
+        line.set_x2(lTp2, bar_index + 2)
+    if not na(lStop)
+        line.set_x2(lStop, bar_index + 2)
+        // the stop line follows a breakeven move
+        line.set_y1(lStop, tStop)
+        line.set_y2(lStop, tStop)
+        if tTp1Hit
+            line.set_color(lStop, color.new(color.gray, 30))
 
 if not na(exitReason)
     won = exitR > 0
@@ -931,10 +960,15 @@ if not na(exitReason)
          textcolor = won ? color.black : color.white, size = size.small)
     if not na(bRisk)
         box.set_right(bRisk, bar_index)
+    if not na(bRew)
         box.set_right(bRew, bar_index)
+    if not na(lEntry)
         line.set_x2(lEntry, bar_index)
+    if not na(lStop)
         line.set_x2(lStop, bar_index)
+    if not na(lTp1)
         line.set_x2(lTp1, bar_index)
+    if not na(lTp2)
         line.set_x2(lTp2, bar_index)
     // flat again
     tDir := 0
@@ -968,7 +1002,7 @@ f_confList() =>
     s == "" ? "no confluence active" : str.substring(s, 0, str.length(s) - 1)
 
 if i_hud and barstate.islast
-    waiting = confidence < i_minConf or nAgree < i_minAgree
+    waiting = confidence < minConf or nAgree < minAgree
     dirTxt  = waiting ? "◆  WAIT" : score > 0 ? "▲  LONG BIAS" : "▼  SHORT BIAS"
     dirCol  = waiting ? color.gray : score > 0 ? C_WIN : C_LOSS
 
