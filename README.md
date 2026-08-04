@@ -111,6 +111,22 @@ entirely (the latter would otherwise just restate VWAP), and confidence is
 computed across the 13 that can actually see something. The HUD's "9/13 agree"
 counts what's live right now.
 
+### Signal frequency
+
+The **Signal frequency** preset moves all four gates together:
+
+| Preset | Confidence | Agreeing | Cooldown | Min R:R |
+|---|---|---|---|---|
+| Conservative | 70% | 6 | 8 bars | 1.6 |
+| Balanced *(default)* | 60% | 5 | 5 bars | 1.3 |
+| Aggressive | 45% | 3 | 2 bars | 1.0 |
+| Custom | uses the fields below verbatim | | | |
+
+Aggressive fires several times more often and takes weaker setups — more
+signals is not more edge. If it's still too quiet, the other limiters are the
+regime filter, the pin guard, and the fact that only one position runs at a
+time (a new signal is ignored while a trade is open).
+
 A signal needs **three** things, not one:
 
 1. Confidence ≥ your minimum (default 60%)
@@ -236,6 +252,26 @@ What *is* genuinely real-time on the chart: the higher-timeframe trend and the
 market-context confluences, both pulled live via `request.security`.
 
 ---
+
+## How far back signals go
+
+Two different limits, worth separating:
+
+- **Triangles** are plots, so they appear on **every bar of loaded history** —
+  as far back as your TradingView plan allows (~5k bars on Basic ≈ 64 trading
+  days on 5m; more on Pro/Premium).
+- **Trade drawings** (zone boxes, stop/target lines, labels) are drawing
+  objects, capped at 500 each. Each trade permanently costs 2 boxes, 4 lines
+  and 2 labels, and with the level and profile overhead the **line** cap binds
+  first at roughly **110 trades**. Past that TradingView silently drops the
+  oldest, so old trades vanish while recent ones stay.
+
+Turn on **Lite trade drawing** to keep only the entry line and labels — about
+**241 trades** of history instead of 110. Turning off *Track trades on chart*
+leaves just the triangles, which are unlimited.
+
+Everything resets per session (cumulative delta, opening range, scorecard), so
+history is computed day by day exactly as it would have been live.
 
 ## How the chart looks
 
