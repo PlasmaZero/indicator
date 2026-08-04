@@ -120,12 +120,19 @@ The **Signal frequency** preset moves all four gates together:
 | Conservative | 70% | 6 | 8 bars | 1.6 |
 | Balanced *(default)* | 60% | 5 | 5 bars | 1.3 |
 | Aggressive | 45% | 3 | 2 bars | 1.0 |
+| Max | 32% | 2 | 0 bars | 0.7 |
 | Custom | uses the fields below verbatim | | | |
 
-Aggressive fires several times more often and takes weaker setups — more
-signals is not more edge. If it's still too quiet, the other limiters are the
-regime filter, the pin guard, and the fact that only one position runs at a
-time (a new signal is ignored while a trade is open).
+**On opposite signal** (Targets & risk) is the other big lever, and usually the
+bigger one. Only a single position runs at a time, so a signal that fires
+against an open trade was previously discarded outright — on a trending day
+that silently swallowed most of the session. Set to *Exit* (the default) it
+closes on the opposing signal and frees the slot for the next bar.
+
+More signals is not more edge. Max takes almost anything with a directional
+lean and its hit rate will be materially worse; the R multiples in the
+scorecard are the thing to watch, not the trade count. Remaining limiters are
+the regime filter and the pin guard, both in their own settings groups.
 
 A signal needs **three** things, not one:
 
@@ -134,7 +141,14 @@ A signal needs **three** things, not one:
    weight can carry a trade alone
 3. Reward:risk to the first target ≥ your minimum
 
-Confidence maps to a grade: **A** ≥ 75, **B** ≥ 60, **C** ≥ 45, **D** below.
+Confidence is shown two ways for the same number: a **1-10 score** on the trade
+block and in the HUD headline, and the underlying percentage next to it. It also
+maps to a grade — **A** ≥ 75, **B** ≥ 60, **C** ≥ 45, **D** below.
+
+The score in a trade block is **frozen at entry**, so it always reflects the
+reading the trade was actually taken on rather than whatever the latest bar
+says. The HUD headline is live.
+
 Set any weight to **0** to switch that confluence off.
 
 The HUD shows the direction, confidence with a meter, the grade, how many
@@ -183,9 +197,21 @@ On the chart:
 | Green dotted | TP2 |
 | ✕ label | Exit, with reason and R multiple |
 
+The entry block reads:
+
+```
+▲ LONG  737.38
+conf 8/10  ●●●●●●●●○○  B
+stop 736.08
+tp1 739.47  (1.6R)
+tp2 743.48
+γ+ · 9 agree · RVOL 3.9
+```
+
 Exits fire on: **STOP**, **TP2**, **BE** (stopped after breakeven move),
-**EOD** (flattened at the close — 0DTE contracts decay to nothing overnight),
-and optionally **FLIP** (score reverses against the position). At TP1 the stop
+**REV** (a signal fired against the position), **EOD** (flattened at the close —
+0DTE contracts decay to nothing overnight), and optionally **FLIP** (score
+reverses against the position). At TP1 the stop
 moves to breakeven by default, so the runner to TP2 is free.
 
 One position at a time — these are intraday signals, not a portfolio.

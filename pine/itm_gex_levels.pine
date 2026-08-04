@@ -60,8 +60,8 @@ i_rthOnly  = input.bool(true, "Regular hours only", group = G_SIG)
 i_skipOpen = input.int(2,  "Skip first N bars",  minval = 0, maxval = 12, group = G_SIG)
 i_skipEOD  = input.int(2,  "Skip last N bars",   minval = 0, maxval = 12, group = G_SIG)
 i_preset   = input.string("Balanced", "Signal frequency",
-     options = ["Conservative", "Balanced", "Aggressive", "Custom"], group = G_SIG,
-     tooltip = "Presets move the four gates together. Aggressive fires several times more often and takes weaker setups. Custom uses the fields below verbatim.")
+     options = ["Conservative", "Balanced", "Aggressive", "Max", "Custom"], group = G_SIG,
+     tooltip = "Presets move the four gates together. Max takes almost anything with a directional lean — expect many more signals and a lower hit rate. Custom uses the fields below verbatim.")
 i_minConf  = input.int(60, "Min confidence %", minval = 20, maxval = 95, step = 5, group = G_SIG,
      tooltip = "Confidence is the weighted agreement across all confluences. 60 ≈ grade B.")
 i_minAgree = input.int(5, "Min confluences agreeing", minval = 2, maxval = 12, group = G_SIG)
@@ -108,6 +108,9 @@ i_manageOn = input.bool(true, "Track trades on chart", group = G_RISK)
 i_beAtTp1  = input.bool(true, "Move stop to breakeven at TP1", group = G_RISK)
 i_exitEOD  = input.bool(true, "Flatten at session close (0DTE)", group = G_RISK)
 i_exitFlip = input.bool(false, "Exit if score flips against the trade", group = G_RISK)
+i_onOpposite = input.string("Exit", "On opposite signal", options = ["Exit", "Ignore"],
+     group = G_RISK,
+     tooltip = "Only one position runs at a time, so a signal against an open trade is otherwise thrown away. Exit closes on it and frees the slot, which is the single biggest source of extra trades.")
 i_pinGuard = input.bool(true, "Block new entries pinned to the control node", group = G_RISK,
      tooltip = "Late in the session in positive gamma, price parked on the control node tends to stay there. Suppresses low-quality entries.")
 i_drawProj = input.bool(true, "Draw target projection", group = G_RISK)
@@ -118,13 +121,17 @@ i_showStats = input.bool(true, "Session stats table", group = G_RISK)
 // Preset resolution. Everything downstream reads these, not the raw inputs, so
 // switching preset moves all four gates together.
 minConf  = i_preset == "Custom" ? i_minConf
-     : i_preset == "Conservative" ? 70 : i_preset == "Balanced" ? 60 : 45
+     : i_preset == "Conservative" ? 70 : i_preset == "Balanced" ? 60
+     : i_preset == "Aggressive" ? 45 : 32
 minAgree = i_preset == "Custom" ? i_minAgree
-     : i_preset == "Conservative" ? 6 : i_preset == "Balanced" ? 5 : 3
+     : i_preset == "Conservative" ? 6 : i_preset == "Balanced" ? 5
+     : i_preset == "Aggressive" ? 3 : 2
 coolBars = i_preset == "Custom" ? i_cooldown
-     : i_preset == "Conservative" ? 8 : i_preset == "Balanced" ? 5 : 2
+     : i_preset == "Conservative" ? 8 : i_preset == "Balanced" ? 5
+     : i_preset == "Aggressive" ? 2 : 0
 minRR    = i_preset == "Custom" ? i_minRR
-     : i_preset == "Conservative" ? 1.6 : i_preset == "Balanced" ? 1.3 : 1.0
+     : i_preset == "Conservative" ? 1.6 : i_preset == "Balanced" ? 1.3
+     : i_preset == "Aggressive" ? 1.0 : 0.7
 
 // ── Display ──────────────────────────────────────────────────────────────────
 i_back = input.int(60, "Ray look-back bars", minval = 0, maxval = 500, group = G_UI)
@@ -473,6 +480,14 @@ score      = totW > 0 ? (bullW - bearW) / totW : 0.0
 confidence = math.round(math.abs(score) * 100)
 nAgree     = score > 0 ? nBull : nBear
 grade      = confidence >= 75 ? "A" : confidence >= 60 ? "B" : confidence >= 45 ? "C" : "D"
+// Same number as `confidence`, on the 1-10 scale shown in the trade block.
+conf10     = math.max(1, math.min(10, int(math.round(confidence / 10.0))))
+
+f_dots(int n) =>
+    string s = ""
+    for i = 1 to 10
+        s := s + (i <= n ? "●" : "○")
+    s
 thrScore   = minConf / 100.0
 
 // =============================================================================
@@ -603,6 +618,9 @@ var float tTp2    = na
 var float tRisk   = na       // initial risk per unit, for R multiples
 var int   tBar    = na
 var bool  tTp1Hit = false
+var int    tConf  = 0        // confidence at entry, frozen for the label
+var string tGrade = ""
+var int    tAgree = 0
 
 var int   nWin = 0
 var int   nLoss = 0
@@ -618,6 +636,9 @@ openLong  = flat and buySig  and i_manageOn
 openShort = flat and sellSig and i_manageOn
 
 if openLong
+    tConf := conf10
+    tGrade := grade
+    tAgree := nAgree
     tDir := 1
     tEntry := close
     tStop := longStop
@@ -627,6 +648,9 @@ if openLong
     tBar := bar_index
     tTp1Hit := false
 if openShort
+    tConf := conf10
+    tGrade := grade
+    tAgree := nAgree
     tDir := -1
     tEntry := close
     tStop := shortStop
@@ -664,6 +688,13 @@ if tDir != 0 and not openLong and not openShort
             exitReason := "FLIP"
             exitPrice := close
         // 0DTE contracts decay to nothing overnight — never hold past the close.
+        // A signal against an open trade is otherwise discarded entirely, since
+        // only one position runs at a time. Closing on it frees the slot for
+        // the next bar.
+        if i_onOpposite == "Exit" and na(exitReason)
+             and ((isLong and sellSig) or (not isLong and buySig))
+            exitReason := "REV"
+            exitPrice := close
         if i_exitEOD and inRth and rthBar >= rthTotal - i_skipEOD and na(exitReason)
             exitReason := "EOD"
             exitPrice := close
@@ -920,13 +951,13 @@ if openLong or openShort
          color = color.new(color.white, 20), width = 2)
     label.new(bar_index, tEntry,
          (isLong ? "▲ LONG " : "▼ SHORT ") + str.tostring(tEntry, format.mintick) +
-         "   " + str.tostring(confidence) + "% " + grade +
+         "\nconf " + str.tostring(tConf) + "/10  " + f_dots(tConf) + "  " + tGrade +
          "\nstop " + str.tostring(tStop, format.mintick) +
          "\ntp1 "  + str.tostring(tTp1, format.mintick) +
          "  (" + str.tostring(math.abs(tTp1 - tEntry) / tRisk, "#.#") + "R)" +
          "\ntp2 "  + str.tostring(tTp2, format.mintick) +
          "\n" + (posGamma ? "γ+" : negGamma ? "γ−" : "γ?") +
-         " · " + str.tostring(nAgree) + " agree · RVOL " + str.tostring(rvol, "#.#"),
+         " · " + str.tostring(tAgree) + " agree · RVOL " + str.tostring(rvol, "#.#"),
          style = isLong ? label.style_label_upper_right : label.style_label_lower_right,
          color = color.new(isLong ? C_WIN : C_LOSS, 15),
          textcolor = isLong ? color.black : color.white, size = size.small)
@@ -981,13 +1012,6 @@ if not na(exitReason)
 // =============================================================================
 //  HUD — one compact card: what the confluences say, and where price can go
 // =============================================================================
-f_meter(int pct) =>
-    int filled = int(math.round(pct / 10.0))
-    string s = ""
-    for i = 1 to 10
-        s := s + (i <= filled ? "█" : "░")
-    s
-
 // The confluences currently voting, strongest first is not worth a sort here —
 // declaration order already runs roughly most- to least-structural.
 f_confList() =>
@@ -1011,14 +1035,14 @@ if i_hud and barstate.islast
          frame_color = color.new(color.gray, 60), frame_width = 1)
 
     // headline: direction + confidence
-    table.cell(t, 0, 0, dirTxt + "     " + str.tostring(confidence) + "%",
+    table.cell(t, 0, 0, dirTxt + "     " + str.tostring(conf10) + "/10",
          text_color = waiting ? color.silver : color.black,
          bgcolor = color.new(dirCol, waiting ? 80 : 10),
          text_size = size.normal, text_halign = text.align_left)
 
     // confidence meter + grade
-    table.cell(t, 0, 1, f_meter(confidence) + "   " + grade + " · " +
-         str.tostring(nAgree) + "/" + str.tostring(array.size(cVotes)) + " agree",
+    table.cell(t, 0, 1, f_dots(conf10) + "  " + str.tostring(confidence) + "%  " + grade +
+         " · " + str.tostring(nAgree) + "/" + str.tostring(array.size(cVotes)) + " agree",
          text_color = dirCol, bgcolor = color.new(color.black, 85),
          text_size = size.small, text_halign = text.align_left)
 
