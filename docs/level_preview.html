@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Level rendering preview</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0d0f13; color: #e8eaed;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 20px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 4px; }
+  p.sub { color: #8a8f98; font-size: 0.8125rem; margin: 0 0 16px; }
+  .panel { background: #131722; border: 1px solid #1e222d; border-radius: 10px;
+    padding: 0; overflow: hidden; margin-bottom: 14px; }
+  .bar { display: flex; gap: 14px; align-items: center; padding: 10px 14px;
+    border-bottom: 1px solid #1e222d; font-size: 0.75rem; color: #8a8f98; flex-wrap: wrap; }
+  label { display: inline-flex; align-items: center; gap: 6px; }
+  select, input[type=range] { accent-color: #2962ff; }
+  select { background: #1e222d; color: #e8eaed; border: 1px solid #2a2e39;
+    border-radius: 5px; padding: 3px 7px; font: inherit; font-size: 0.75rem; }
+  svg { display: block; width: 100%; height: auto; }
+  .note { font-size: 0.75rem; color: #8a8f98; line-height: 1.5; }
+  code { background: #1e222d; padding: 1px 5px; border-radius: 4px; font-size: 0.72rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Level rendering preview</h1>
+  <p class="sub">Mock 5m chart using the same alpha stack, weights, dim values and label
+     de-collision as the Pine draw pass — a check on the look before pasting.</p>
+
+  <div class="panel">
+    <div class="bar">
+      <label>Style
+        <select id="style">
+          <option>Bands</option><option>Lines</option><option>Minimal</option>
+        </select>
+      </label>
+      <label>Glow <input id="glow" type="range" min="0" max="100" step="5" value="50"><span id="glowV">50</span></label>
+      <label><input id="fade" type="checkbox" checked> Fade distant</label>
+      <label><input id="mids" type="checkbox" checked> Midpoints</label>
+      <label><input id="range" type="checkbox" checked> Wall range</label>
+      <label><input id="minimal" type="checkbox"> Minimal mode</label>
+      <label>Label gap <input id="gap" type="range" min="0" max="1.5" step="0.05" value="0.55"><span id="gapV">0.55</span></label>
+    </div>
+    <div id="chart"></div>
+  </div>
+
+  <p class="note">
+    Majors (walls, flip, control node) carry the heaviest halo and sit at full opacity.
+    Secondary walls, midpoints, expected-move and session levels are progressively
+    dimmed so they read as context rather than competing with the levels price is
+    actually working. Distance fade pushes far levels back further still.
+  </p>
+</div>
+
+<script>
+const C = { call:'#2962ff', put:'#ff2d3f', flip:'#e8eaed', node:'#ffd54a',
+            dim:'#8a8f98', teal:'#26a69a' };
+
+// Synthetic 5m session that ranges between the walls.
+const candles = (() => {
+  let p = 752, out = [], seed = 7;
+  const rnd = () => (seed = (seed*1103515245+12345) & 0x7fffffff) / 0x7fffffff;
+  for (let i=0;i<78;i++){
+    const drift = Math.sin(i/11)*1.5 + (rnd()-0.5)*1.1;
+    const o=p, c=p+drift, h=Math.max(o,c)+rnd()*0.7, l=Math.min(o,c)-rnd()*0.7;
+    out.push({o,h,l,c}); p=c;
+  }
+  return out;
+})();
+
+// price, colour, weight, dim, label  — mirrors the Pine call sites
+const LEVELS = [
+  { p:765,    c:C.call, w:3.0, d:0,  t:'CALL WALL',   key:'wall' },
+  { p:750,    c:C.put,  w:3.0, d:0,  t:'PUT WALL',    key:'wall' },
+  { p:756.74, c:C.flip, w:2.5, d:0,  t:'FLIP',  key:'flip', dark:true },
+  { p:760,    c:C.node, w:2.5, d:0,  t:'NODE',key:'node', dark:true },
+  { p:768,    c:C.call, w:1.4, d:12, t:'CALL W2',     key:'w2' },
+  { p:746,    c:C.put,  w:1.4, d:12, t:'PUT W2',      key:'w2' },
+  { p:771,    c:C.call, w:1.0, d:22, t:'CALL W3',     key:'w3' },
+  { p:743,    c:C.put,  w:1.0, d:22, t:'PUT W3',      key:'w3' },
+  { p:760.87, c:C.call, w:0.7, d:38, t:'MID',         key:'mid' },
+  { p:753.37, c:C.put,  w:0.7, d:38, t:'MID',         key:'mid' },
+  { p:762.1,  c:C.call, w:0.9, d:28, t:'EM +',        key:'em' },
+  { p:753.2,  c:C.put,  w:0.9, d:28, t:'EM −',        key:'em' },
+  { p:757.6,  c:C.dim,  w:0.6, d:30, t:'OPEN',        key:'sess' },
+  { p:747.0,  c:C.dim,  w:0.6, d:30, t:'PDC',         key:'sess' },
+  { p:766.4,  c:C.teal, w:0.7, d:24, t:'ONH',         key:'on' },
+  { p:749.2,  c:C.teal, w:0.7, d:24, t:'ONL',         key:'on' },
+];
+
+const ATR = 1.6;
+const $ = s => document.querySelector(s);
+const rgba = (hex, transp) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n>>16&255},${n>>8&255},${n&255},${(1 - transp/100).toFixed(3)})`;
+};
+
+function draw() {
+  const style = $('#style').value, glow = +$('#glow').value;
+  const doFade = $('#fade').checked, showMid = $('#mids').checked;
+  const showRange = $('#range').checked, minimal = $('#minimal').checked;
+  $('#glowV').textContent = glow;
+  $('#gapV').textContent = (+$('#gap').value).toFixed(2);
+
+  const W=1060, H=520, padL=8, padR=132, padT=14, padB=14;
+  const plotW = W-padL-padR;
+  const lo=740, hi=774;
+  const y = v => padT + (hi-v)/(hi-lo) * (H-padT-padB);
+  const last = candles[candles.length-1].c;
+
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Level rendering preview">`;
+  s += `<rect width="${W}" height="${H}" fill="#131722"/>`;
+
+  const visible = LEVELS.filter(L => {
+    if (minimal) return ['wall','flip','node'].includes(L.key);
+    if (L.key === 'mid' && !showMid) return false;
+    return true;
+  });
+
+  if (showRange && !minimal) {
+    s += `<rect x="${padL}" y="${y(765)}" width="${plotW}" height="${y(750)-y(765)}"
+          fill="${rgba('#808080', 95)}"/>`;
+  }
+
+  // halo stack — identical alpha arithmetic to the Pine draw pass
+  for (const L of visible) {
+    let fade = L.d;
+    if (doFade) fade += Math.min(38, Math.abs(L.p - last)/(ATR*9)*38);
+    const hh = ATR * 0.07 * L.w * (glow/50);
+    const px = v => Math.abs(y(L.p) - y(L.p - v));
+    if (style === 'Bands' && hh > 0 && glow > 0) {
+      [[3.0, Math.min(97, 88+fade)], [1.8, Math.min(95, 79+fade)], [0.8, Math.min(93, 67+fade)]]
+        .forEach(([m, tr]) => {
+          const half = px(hh*m);
+          s += `<rect x="${padL}" y="${y(L.p)-half}" width="${plotW}" height="${half*2}"
+                fill="${rgba(L.c, tr)}"/>`;
+        });
+    }
+    const lw = style === 'Minimal' ? 1 : (L.w >= 2 ? 2 : 1);
+    s += `<line x1="${padL}" y1="${y(L.p)}" x2="${padL+plotW}" y2="${y(L.p)}"
+          stroke="${rgba(L.c, Math.min(88, fade))}" stroke-width="${lw}"/>`;
+  }
+
+  // candles
+  const cw = plotW / candles.length;
+  candles.forEach((k, i) => {
+    const x = padL + i*cw + cw/2;
+    const up = k.c >= k.o;
+    const col = up ? '#26a69a' : '#ef5350';
+    s += `<line x1="${x}" y1="${y(k.h)}" x2="${x}" y2="${y(k.l)}" stroke="${col}" stroke-width="1"/>`;
+    s += `<rect x="${x-cw*0.3}" y="${y(Math.max(k.o,k.c))}" width="${cw*0.6}"
+          height="${Math.max(1, Math.abs(y(k.o)-y(k.c)))}" fill="${col}"/>`;
+  });
+
+  // right-edge pills, pushed apart exactly as the Pine draw pass does
+  const minSep = ATR * (+$('#gap').value);
+  let prevY = null;
+  const sorted = visible.slice().sort((a,b) => a.p - b.p);
+  for (const L of sorted) {
+    let fade = L.d;
+    if (doFade) fade += Math.min(38, Math.abs(L.p - last)/(ATR*9)*38);
+    let ly = L.p;
+    if (prevY !== null && ly - prevY < minSep) ly = prevY + minSep;
+    prevY = ly;
+    const txt = `${L.t}  ${L.p.toFixed(2)}`;
+    const wpx = txt.length*5.4 + 12;
+    s += `<rect x="${padL+plotW+6}" y="${y(ly)-7.5}" width="${wpx}" height="15" rx="3"
+          fill="${rgba(L.c, Math.min(72, 12+fade))}"/>`;
+    s += `<text x="${padL+plotW+12}" y="${y(ly)+3.5}" font-size="9.5"
+          font-family="system-ui, sans-serif" font-weight="600"
+          fill="${L.dark ? '#000' : '#fff'}">${txt}</text>`;
+  }
+  s += `</svg>`;
+  $('#chart').innerHTML = s;
+}
+['style','glow','fade','mids','range','minimal','gap'].forEach(id =>
+  $('#'+id).addEventListener('input', draw));
+draw();
+</script>
+</body>
+</html>

@@ -113,6 +113,17 @@ i_showStats = input.bool(true, "Session stats table", group = G_RISK)
 // ── Display ──────────────────────────────────────────────────────────────────
 i_back = input.int(60, "Ray look-back bars", minval = 0, maxval = 500, group = G_UI)
 i_fwd  = input.int(18, "Ray extension bars", minval = 1, maxval = 200, group = G_UI)
+i_style   = input.string("Bands", "Level style", options = ["Bands", "Lines", "Minimal"], group = G_UI)
+i_glow    = input.int(50, "Glow intensity", minval = 0, maxval = 100, step = 5, group = G_UI)
+i_fadeFar = input.bool(true, "Fade distant levels", group = G_UI,
+     tooltip = "Levels far from price recede so the ones price is actually working read first.")
+i_showRange = input.bool(true, "Shade wall-to-wall range", group = G_UI)
+i_showMids  = input.bool(true, "Gamma midpoints", group = G_UI,
+     tooltip = "Halfway marks between the flip and each wall — where price often pauses between levels.")
+i_showOpen  = input.bool(true, "Session open / prior close", group = G_UI)
+i_labelGap  = input.float(0.55, "Label spacing (ATR)", minval = 0.0, maxval = 3.0, step = 0.05,
+     group = G_UI,
+     tooltip = "Minimum vertical gap between level labels so close levels don't stack. Raise it if labels still collide on a zoomed-out chart; 0 disables the nudging.")
 i_hud       = input.bool(true, "Show HUD", group = G_UI)
 i_hudDetail = input.bool(false, "HUD · list active confluences", group = G_UI)
 i_minimal   = input.bool(false, "Minimal mode", group = G_UI,
@@ -151,6 +162,8 @@ var float gexPW   = f_key(i_blob, "pw")
 var float gexCN   = f_key(i_blob, "cn")
 var float gexCW2  = f_key(i_blob, "cw2")
 var float gexPW2  = f_key(i_blob, "pw2")
+var float gexCW3  = f_key(i_blob, "cw3")
+var float gexPW3  = f_key(i_blob, "pw3")
 var float gexNet  = f_key(i_blob, "net")
 var float gexEM   = f_key(i_blob, "em")
 
@@ -242,6 +255,11 @@ if newDay
     sessOpen := open
 emUp = na(gexEM) or na(sessOpen) ? na : sessOpen + gexEM
 emDn = na(gexEM) or na(sessOpen) ? na : sessOpen - gexEM
+
+// Midpoints between the flip and each wall — price frequently stalls here on
+// the way from one level to the next, so they serve as targets too.
+midUp = na(flipLvl) or na(cwLvl) ? na : (flipLvl + cwLvl) / 2
+midDn = na(flipLvl) or na(pwLvl) ? na : (flipLvl + pwLvl) / 2
 
 // =============================================================================
 //  Regime
@@ -462,6 +480,14 @@ f_levelPool() =>
         array.push(arr, pwLvl)
     if not na(gexPW2)
         array.push(arr, gexPW2)
+    if not na(gexCW3)
+        array.push(arr, gexCW3)
+    if not na(gexPW3)
+        array.push(arr, gexPW3)
+    if i_showMids and not na(midUp)
+        array.push(arr, midUp)
+    if i_showMids and not na(midDn)
+        array.push(arr, midDn)
     if not na(cnLvl)
         array.push(arr, cnLvl)
     if not na(flipLvl)
@@ -637,57 +663,182 @@ if not na(exitReason)
 // =============================================================================
 //  Drawing — levels
 // =============================================================================
-f_ray(float price, color col, int width, bool show, string txt) =>
-    var line  glow = na
-    var line  core = na
-    var label tag  = na
-    if barstate.islast
-        line.delete(glow)
-        line.delete(core)
-        label.delete(tag)
-        if show and not na(price)
-            x1 = bar_index - i_back
-            x2 = bar_index + i_fwd
-            glow := line.new(x1, price, x2, price, color = color.new(col, 78), width = width + 4)
-            core := line.new(x1, price, x2, price, color = col, width = width)
-            tag  := label.new(x2, price, txt + "  " + str.tostring(price, format.mintick),
-                 style = label.style_label_left, color = color.new(col, 15),
-                 textcolor = color.white, size = size.small)
+// Levels are collected into arrays first and drawn in a single pass. Drawing
+// them one call at a time is simpler, but then no call can see where the others
+// landed — and on a 0DTE chart the flip, a midpoint and an EM band routinely sit
+// within a few cents of each other, so their labels overlap into mush. Batching
+// lets the draw pass sort by price and push colliding labels apart.
+lvPrice = array.new<float>()
+lvCol   = array.new<color>()
+lvTxtC  = array.new<color>()
+lvW     = array.new<float>()
+lvDim   = array.new<int>()
+lvTxt   = array.new<string>()
 
-f_ray(flipLvl, c_flip, 2, i_showFlip and not na(flipLvl), hasGex ? "FLIP" : "VWAP")
-f_ray(cwLvl,   c_call, 3, i_showWall and not na(cwLvl),   hasGex ? "CALL WALL" : "PDH")
-f_ray(pwLvl,   c_put,  3, i_showWall and not na(pwLvl),   hasGex ? "PUT WALL"  : "PDL")
-f_ray(gexCW2,  c_call, 1, i_showWall and not i_minimal and not na(gexCW2),  "CALL W2")
-f_ray(gexPW2,  c_put,  1, i_showWall and not i_minimal and not na(gexPW2),  "PUT W2")
-f_ray(cnLvl,   c_node, 2, i_showNode and not na(cnLvl),   hasGex ? "CONTROL NODE" : "POC")
+f_add(float p, color c, color tc, float w, int d, bool show, string t) =>
+    if show and not na(p)
+        array.push(lvPrice, p)
+        array.push(lvCol, c)
+        array.push(lvTxtC, tc)
+        array.push(lvW, w)
+        array.push(lvDim, d)
+        array.push(lvTxt, t)
 
-f_ray(emUp, color.new(c_call, 40), 1, i_showEM and not i_minimal and not na(emUp), "EM +")
-f_ray(emDn, color.new(c_put,  40), 1, i_showEM and not i_minimal and not na(emDn), "EM −")
+C_DIM = #8a8f98
 
-// Auto extras
-f_ray(pdh,  color.new(color.gray, 20), 1, i_showPDHL and not hasGex and not na(pdh), "PDH")
-f_ray(pdl,  color.new(color.gray, 20), 1, i_showPDHL and not hasGex and not na(pdl), "PDL")
-f_ray(onh,  color.new(color.teal, 20), 1, i_showONHL and not i_minimal and not na(onh), "ONH")
-f_ray(onl,  color.new(color.teal, 20), 1, i_showONHL and not i_minimal and not na(onl), "ONL")
+var float pdc = na
+if newDay
+    pdc := close[1]
 
-plot(i_showVWAP ? vwap : na, "VWAP", color.new(color.orange, 20), 1)
-plot(i_showVWAP and not i_minimal ? vwap + vwapSd : na, "VWAP +1σ", color.new(color.orange, 70), 1)
-plot(i_showVWAP and not i_minimal ? vwap - vwapSd : na, "VWAP −1σ", color.new(color.orange, 70), 1)
+// Majors — full opacity, heaviest halo
+f_add(cwLvl,   c_call, color.white, 3.0, 0, i_showWall and not na(cwLvl),  hasGex ? "CALL WALL" : "PDH")
+f_add(pwLvl,   c_put,  color.white, 3.0, 0, i_showWall and not na(pwLvl),  hasGex ? "PUT WALL" : "PDL")
+f_add(flipLvl, c_flip, color.black, 2.5, 0, i_showFlip and not na(flipLvl), hasGex ? "FLIP" : "VWAP")
+f_add(cnLvl,   c_node, color.black, 2.5, 0, i_showNode and not na(cnLvl),  hasGex ? "NODE" : "POC")
 
-// Per-strike profile rays, width scaled by |GEX| — the panel from the screenshot
+// Secondary and third walls
+f_add(gexCW2, c_call, color.white, 1.4, 12, i_showWall and not i_minimal and not na(gexCW2), "CW2")
+f_add(gexPW2, c_put,  color.white, 1.4, 12, i_showWall and not i_minimal and not na(gexPW2), "PW2")
+f_add(gexCW3, c_call, color.white, 1.0, 22, i_showWall and not i_minimal and not na(gexCW3), "CW3")
+f_add(gexPW3, c_put,  color.white, 1.0, 22, i_showWall and not i_minimal and not na(gexPW3), "PW3")
+
+// Midpoints, expected move, session references
+f_add(midUp, c_call, color.white, 0.7, 38, i_showMids and not i_minimal and not na(midUp), "MID")
+f_add(midDn, c_put,  color.white, 0.7, 38, i_showMids and not i_minimal and not na(midDn), "MID")
+f_add(emUp,  c_call, color.white, 0.9, 28, i_showEM and not i_minimal and not na(emUp), "EM+")
+f_add(emDn,  c_put,  color.white, 0.9, 28, i_showEM and not i_minimal and not na(emDn), "EM−")
+f_add(sessOpen, C_DIM, color.white, 0.6, 30, i_showOpen and not i_minimal and not na(sessOpen), "OPEN")
+f_add(pdc,      C_DIM, color.white, 0.6, 30, i_showOpen and not i_minimal and not na(pdc), "PDC")
+f_add(pdh, C_DIM, color.white, 0.8, 18, i_showPDHL and not hasGex and not na(pdh), "PDH")
+f_add(pdl, C_DIM, color.white, 0.8, 18, i_showPDHL and not hasGex and not na(pdl), "PDL")
+f_add(onh, color.teal, color.white, 0.7, 24, i_showONHL and not i_minimal and not na(onh), "ONH")
+f_add(onl, color.teal, color.white, 0.7, 24, i_showONHL and not i_minimal and not na(onl), "ONL")
+
+var box[]   lvBoxes  = array.new<box>()
+var line[]  lvLines  = array.new<line>()
+var label[] lvLabels = array.new<label>()
+var box     rangeBox = na
+
+if barstate.islast
+    if array.size(lvBoxes) > 0
+        for i = 0 to array.size(lvBoxes) - 1
+            box.delete(array.get(lvBoxes, i))
+        array.clear(lvBoxes)
+    if array.size(lvLines) > 0
+        for i = 0 to array.size(lvLines) - 1
+            line.delete(array.get(lvLines, i))
+        array.clear(lvLines)
+    if array.size(lvLabels) > 0
+        for i = 0 to array.size(lvLabels) - 1
+            label.delete(array.get(lvLabels, i))
+        array.clear(lvLabels)
+    box.delete(rangeBox)
+
+    x1 = bar_index - i_back
+    x2 = bar_index + i_fwd
+
+    // Wall-to-wall shading: the band dealers are most likely to hold price in.
+    if i_showRange and not i_minimal and not na(cwLvl) and not na(pwLvl) and cwLvl > pwLvl
+        rangeBox := box.new(x1, cwLvl, x2, pwLvl, border_width = 0,
+             bgcolor = color.new(color.gray, 95))
+
+    n = array.size(lvPrice)
+    if n > 0
+        // draw order: lowest price first, so the label de-collision can walk up
+        order = array.new<int>()
+        for i = 0 to n - 1
+            array.push(order, i)
+        // `to n - 2` would count downward and index past the end when only one
+        // level is visible (minimal mode, or a chart with just the flip).
+        if n > 1
+            for i = 0 to n - 2
+                for j = 0 to n - 2 - i
+                    if array.get(lvPrice, array.get(order, j)) > array.get(lvPrice, array.get(order, j + 1))
+                        tmp = array.get(order, j)
+                        array.set(order, j, array.get(order, j + 1))
+                        array.set(order, j + 1, tmp)
+
+        // Bands and core lines sit at the true price…
+        for k = 0 to n - 1
+            idx = array.get(order, k)
+            p   = array.get(lvPrice, idx)
+            col = array.get(lvCol, idx)
+            w   = array.get(lvW, idx)
+            int fade = array.get(lvDim, idx)
+            if i_fadeFar and atr > 0
+                fade += int(math.min(38.0, math.abs(p - close) / (atr * 9) * 38.0))
+
+            h = atr * 0.07 * w * (i_glow / 50.0)
+            if i_style == "Bands" and h > 0 and i_glow > 0
+                array.push(lvBoxes, box.new(x1, p + h * 3.0, x2, p - h * 3.0, border_width = 0,
+                     bgcolor = color.new(col, math.min(97, 88 + fade))))
+                array.push(lvBoxes, box.new(x1, p + h * 1.8, x2, p - h * 1.8, border_width = 0,
+                     bgcolor = color.new(col, math.min(95, 79 + fade))))
+                array.push(lvBoxes, box.new(x1, p + h * 0.8, x2, p - h * 0.8, border_width = 0,
+                     bgcolor = color.new(col, math.min(93, 67 + fade))))
+
+            array.push(lvLines, line.new(x1, p, x2, p,
+                 color = color.new(col, math.min(88, fade)),
+                 width = i_style == "Minimal" ? 1 : w >= 2.0 ? 2 : 1))
+
+        // …labels get nudged apart so none of them stack on top of another.
+        // Pine cannot measure the chart's vertical scale, so label height has to
+        // be approximated in ATR terms. The right value depends on how far the
+        // chart is zoomed out, hence the input.
+        minSep = atr * i_labelGap
+        float prevY = na
+        for k = 0 to n - 1
+            idx = array.get(order, k)
+            p   = array.get(lvPrice, idx)
+            col = array.get(lvCol, idx)
+            int fade = array.get(lvDim, idx)
+            if i_fadeFar and atr > 0
+                fade += int(math.min(38.0, math.abs(p - close) / (atr * 9) * 38.0))
+
+            float ly = p
+            if not na(prevY) and ly - prevY < minSep
+                ly := prevY + minSep
+            prevY := ly
+
+            array.push(lvLabels, label.new(x2, ly,
+                 array.get(lvTxt, idx) + "  " + str.tostring(p, format.mintick),
+                 style = label.style_label_left,
+                 color = color.new(col, math.min(72, 12 + fade)),
+                 textcolor = array.get(lvTxtC, idx), size = size.tiny))
+
+plot(i_showVWAP ? vwap : na, "VWAP", color.new(color.orange, 25), 1)
+plot(i_showVWAP and not i_minimal ? vwap + vwapSd : na, "VWAP +1σ",
+     color.new(color.orange, 75), 1)
+plot(i_showVWAP and not i_minimal ? vwap - vwapSd : na, "VWAP −1σ",
+     color.new(color.orange, 75), 1)
+
+// Per-strike profile — each strike drawn as a band whose thickness tracks its
+// share of total gamma, the chart-side echo of the dashboard panel.
 var line[] profLines = array.new<line>()
+var box[]  profBoxes = array.new<box>()
 if barstate.islast and i_profShow and not i_minimal and array.size(pStrike) > 0
     if array.size(profLines) > 0
         for i = 0 to array.size(profLines) - 1
             line.delete(array.get(profLines, i))
         array.clear(profLines)
+    if array.size(profBoxes) > 0
+        for i = 0 to array.size(profBoxes) - 1
+            box.delete(array.get(profBoxes, i))
+        array.clear(profBoxes)
     for i = 0 to array.size(pStrike) - 1
-        s = array.get(pStrike, i)
-        g = array.get(pGex, i)
+        s   = array.get(pStrike, i)
+        g   = array.get(pGex, i)
         mag = pMaxAbs > 0 ? math.abs(g) / pMaxAbs : 0.0
-        int w = math.max(1, int(math.round(mag * i_profWidth)))
-        c = color.new(g >= 0 ? c_call : c_put, int(math.round(85 - mag * 55)))
-        array.push(profLines, line.new(bar_index - i_back, s, bar_index + i_fwd, s, color = c, width = w))
+        if mag > 0.02
+            pc = g >= 0 ? c_call : c_put
+            bh = atr * 0.18 * mag * (i_glow / 50.0)
+            if i_style == "Bands" and bh > 0 and i_glow > 0
+                array.push(profBoxes, box.new(bar_index - i_back, s + bh,
+                     bar_index + i_fwd, s - bh, border_width = 0,
+                     bgcolor = color.new(pc, int(math.round(92 - mag * 14)))))
+            array.push(profLines, line.new(bar_index - i_back, s, bar_index + i_fwd, s,
+                 color = color.new(pc, int(math.round(80 - mag * 45))),
+                 width = math.max(1, int(math.round(mag * i_profWidth)))))
 
 // =============================================================================
 //  Drawing — signals

@@ -88,6 +88,8 @@ class Levels:
     put_wall: float | None = None
     call_wall_2: float | None = None
     put_wall_2: float | None = None
+    call_wall_3: float | None = None
+    put_wall_3: float | None = None
     gamma_flip: float | None = None
     control_node: float | None = None
     expected_move: float | None = None
@@ -181,11 +183,15 @@ def derive_levels(symbol: str, expiry: date, contracts: list[Contract], S: float
         lv.call_wall = ranked[0][0]
         if len(ranked) > 1:
             lv.call_wall_2 = ranked[1][0]
+        if len(ranked) > 2:
+            lv.call_wall_3 = ranked[2][0]
     if puts_below:
         ranked = sorted(puts_below.items(), key=lambda kv: kv[1])
         lv.put_wall = ranked[0][0]
         if len(ranked) > 1:
             lv.put_wall_2 = ranked[1][0]
+        if len(ranked) > 2:
+            lv.put_wall_3 = ranked[2][0]
 
     # Control node: the single strike with the most absolute gamma — the magnet.
     lv.control_node = max(prof.items(), key=lambda kv: abs(kv[1]))[0]
@@ -281,6 +287,8 @@ def pine_blob(lv: Levels) -> str:
         ("cn", lv.control_node),
         ("cw2", lv.call_wall_2),
         ("pw2", lv.put_wall_2),
+        ("cw3", lv.call_wall_3),
+        ("pw3", lv.put_wall_3),
         ("em", lv.expected_move),
     ]
     body = ",".join(f"{k}:{fmt(v)}" for k, v in parts if v is not None)

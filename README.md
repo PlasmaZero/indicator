@@ -237,12 +237,44 @@ market-context confluences, both pulled live via `request.security`.
 
 ---
 
-## Keeping the chart readable
+## How the chart looks
 
-Turn on **Minimal mode** (Display group) to draw only the flip, the two main
-walls and the control node — it hides secondary walls, the expected-move band,
-overnight levels, VWAP bands and the strike profile. Worth switching on once
-you know what the levels mean.
+Levels render as a bright core line inside a stack of three translucent bands.
+Pine has no real glow, so the stack fakes one — each band wider and fainter than
+the one inside it — which reads as a halo rather than a hairline.
+
+Visual weight follows importance, so the chart tells you what matters without
+reading a single label:
+
+| Tier | Levels | Treatment |
+|---|---|---|
+| Major | call/put wall, gamma flip, control node | full opacity, heaviest halo, 2px core |
+| Secondary | CW2/PW2, CW3/PW3 | progressively dimmed |
+| Context | midpoints, EM band, session open, prior close, ONH/ONL | faint |
+
+Two more things keep it legible:
+
+- **Distance fade** — levels far from price recede, so the ones price is
+  actually working read first.
+- **Label de-collision** — labels are drawn in one sorted pass and nudged apart
+  when levels sit close together. Without it the flip, a midpoint and an EM band
+  routinely land within cents of each other and their labels turn to mush. Pine
+  can't measure the chart's vertical scale, so the gap is set in ATR terms via
+  *Label spacing* — raise it if labels still collide when zoomed out.
+
+**Levels drawn:** call/put walls 1-3, gamma flip, control node, the midpoints
+between the flip and each wall, expected-move bands, session open, prior close,
+prior day high/low, overnight high/low, VWAP with 1σ bands, and the per-strike
+gamma profile. Everything except VWAP also feeds the target engine, so a level
+you can see is a level a trade can exit at.
+
+**Display controls:** *Level style* (Bands / Lines / Minimal), *Glow intensity*,
+*Fade distant levels*, *Shade wall-to-wall range*, *Gamma midpoints*, *Label
+spacing*, and **Minimal mode** — which strips it to just the flip, both walls
+and the control node.
+
+`docs/level_preview.html` is a mock chart using the same maths; open it to try
+the settings without touching TradingView.
 
 ## Bringing your own chain
 
