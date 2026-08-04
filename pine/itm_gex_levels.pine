@@ -475,8 +475,19 @@ if array.size(cVotes) > 0
             bearW += w * (-v)
             nBear += 1
 
-// score keeps the -1…+1 convention the rest of the script uses
-score      = totW > 0 ? (bullW - bearW) / totW : 0.0
+// Confidence is two separate things multiplied together:
+//   purity        — of the confluences that have an opinion, how one-sided is it
+//   participation — how much of the available evidence has an opinion at all
+// Dividing straight through by totW (the old formula) is purity x participation,
+// which double-counts the penalty: neutral confluences shrink the numerator AND
+// votes are magnitude-scaled, so even a solid 9-confluence trend only scored
+// ~43% and the 60% gate was effectively unreachable. Participation is softened
+// with a square root so a genuine setup can clear the gate while two weak votes
+// on their own still cannot.
+actW       = bullW + bearW
+purity     = actW > 0 ? (bullW - bearW) / actW : 0.0
+partic     = totW > 0 ? actW / totW : 0.0
+score      = purity * math.sqrt(partic)
 confidence = math.round(math.abs(score) * 100)
 nAgree     = score > 0 ? nBull : nBear
 grade      = confidence >= 75 ? "A" : confidence >= 60 ? "B" : confidence >= 45 ? "C" : "D"
@@ -985,7 +996,7 @@ if tDir != 0
 if not na(exitReason)
     won = exitR > 0
     label.new(bar_index, exitPrice,
-         "✕ " + exitReason + "  " + str.tostring(exitR, "+#.##;-#.##") + "R",
+         "✕ " + exitReason + "  " + str.tostring(nz(exitR), "+0.00;-0.00") + "R",
          style = label.style_label_left,
          color = color.new(won ? C_WIN : C_LOSS, 15),
          textcolor = won ? color.black : color.white, size = size.small)
@@ -1088,7 +1099,7 @@ if i_showStats and i_manageOn and barstate.islast
     table.cell(st, 1, 2, nTot > 0 ? str.tostring(100.0 * nWin / nTot, "#.#") + "%" : "—",
          text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
     table.cell(st, 0, 3, "TOTAL R", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(st, 1, 3, str.tostring(sumR, "+#.##;-#.##"),
+    table.cell(st, 1, 3, str.tostring(sumR, "+0.00;-0.00"),
          text_color = sumR >= 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
 
 // =============================================================================
@@ -1101,7 +1112,7 @@ alertcondition(not na(exitReason), "ITM·GEX Exit", "EXIT {{ticker}} @ {{close}}
 if not na(exitReason)
     alert("EXIT " + syminfo.ticker + " (" + exitReason + ") @ " +
          str.tostring(exitPrice, format.mintick) + " | " +
-         str.tostring(exitR, "+#.##;-#.##") + "R", alert.freq_once_per_bar_close)
+         str.tostring(nz(exitR), "+0.00;-0.00") + "R", alert.freq_once_per_bar_close)
 
 if buySig
     alert("BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +

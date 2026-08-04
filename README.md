@@ -79,11 +79,32 @@ volume-profile point of control as the magnet) and keeps working on any symbol.
 ## Confluences and confidence
 
 Fifteen independent reads on the tape. Each casts a weighted bull / bear /
-neutral vote, and **confidence** is how strongly they agree:
+neutral vote, and **confidence** combines two separate things:
 
 ```
-confidence = |bullWeight − bearWeight| / totalWeight × 100
+purity        = |bullWeight − bearWeight| / activeWeight    # how one-sided
+participation = activeWeight / availableWeight              # how much has an opinion
+confidence    = purity × √participation × 100
 ```
+
+*Active* weight is the confluences actually voting; *available* is those with
+data. The square root matters: dividing straight through by available weight
+double-penalises, because neutral confluences shrink the numerator **and** votes
+are magnitude-scaled. Under that formula a solid nine-confluence trend scored
+only 43% and the 60% gate was effectively unreachable — a day could pass with a
+single signal. Softening participation lets a real setup clear the bar while two
+weak votes on their own still can't.
+
+Roughly what the numbers mean:
+
+| Setup | Confidence | Clears |
+|---|---|---|
+| 2 weak confluences | ~21% | nothing |
+| 5 moderate | ~37% | Max |
+| 7 moderate | ~54% | Aggressive |
+| 9 strong | ~66% | Balanced |
+| 12 strong | ~80% | Conservative |
+| conflicted (6 up, 4 down) | ~25% | nothing — correctly suppressed |
 
 | # | Confluence | Wt | What it reads |
 |---|---|---|---|
