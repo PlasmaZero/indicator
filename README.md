@@ -103,6 +103,14 @@ confidence = |bullWeight − bearWeight| / totalWeight × 100
 | 14 | Market context | 8 | SPY above/below its VWAP as a breadth proxy |
 | 15 | Delta divergence | 10 | New price extreme that order flow doesn't confirm |
 
+**Confluences with no data are excluded, not counted as abstentions.** A sweep
+that didn't happen is real information and should dilute confidence; an
+expected-move band that doesn't exist is not information at all. So without a
+GEX blob the EM-band and gamma-fit confluences drop out of the denominator
+entirely (the latter would otherwise just restate VWAP), and confidence is
+computed across the 13 that can actually see something. The HUD's "9/13 agree"
+counts what's live right now.
+
 A signal needs **three** things, not one:
 
 1. Confidence ≥ your minimum (default 60%)

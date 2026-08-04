@@ -365,48 +365,56 @@ cNames = array.new<string>()
 cVotes = array.new<float>()
 cWts   = array.new<float>()
 
-f_vote(string[] nmA, float[] vA, float[] wA, string nm, float v, float w) =>
-    if w > 0 and not na(v)
+// `avail` separates "this confluence has no data" from "it has data and is
+// neutral". A sweep that did not happen is real information and should dilute
+// confidence; an expected-move band that does not exist is not information at
+// all, and must stay out of the denominator entirely.
+f_vote(string[] nmA, float[] vA, float[] wA, string nm, float v, float w, bool avail) =>
+    if w > 0 and avail and not na(v)
         array.push(nmA, nm)
         array.push(vA, math.max(-1.0, math.min(1.0, v)))
         array.push(wA, w)
 
 // 1 trend, 2 momentum
-f_vote(cNames, cVotes, cWts, "Trend", atr > 0 ? (emaF - emaS) / (atr * 0.6) : 0.0, w_trend)
-f_vote(cNames, cVotes, cWts, "Momentum", (rsi - 50) / 20.0, w_mom)
+f_vote(cNames, cVotes, cWts, "Trend", atr > 0 ? (emaF - emaS) / (atr * 0.6) : 0.0, w_trend, atr > 0)
+f_vote(cNames, cVotes, cWts, "Momentum", (rsi - 50) / 20.0, w_mom, not na(rsi))
 // 3 participation confirms the bar's own direction
 f_vote(cNames, cVotes, cWts, "RVOL",
-     rvol > 1.15 ? (close > open ? 1.0 : -1.0) * math.min((rvol - 1.0) / 1.5, 1.0) : 0.0, w_rvol)
+     rvol > 1.15 ? (close > open ? 1.0 : -1.0) * math.min((rvol - 1.0) / 1.5, 1.0) : 0.0, w_rvol, true)
 // 4 order flow
-f_vote(cNames, cVotes, cWts, "Delta", cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0, w_delta)
+f_vote(cNames, cVotes, cWts, "Delta", cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0, w_delta, cvdNorm > 0)
 // 5 value area
-f_vote(cNames, cVotes, cWts, "VWAP", atr > 0 ? (close - vwap) / (atr * 1.2) : 0.0, w_vwap)
+f_vote(cNames, cVotes, cWts, "VWAP", atr > 0 ? (close - vwap) / (atr * 1.2) : 0.0, w_vwap, atr > 0 and not na(vwap))
 // 6 a failed sweep is the highest-quality single tell on this list
-f_vote(cNames, cVotes, cWts, "Sweep", sweepLo ? 1.0 : sweepHi ? -1.0 : 0.0, w_sweep)
+f_vote(cNames, cVotes, cWts, "Sweep", sweepLo ? 1.0 : sweepHi ? -1.0 : 0.0, w_sweep, true)
 // 7 conviction of the current bar
-f_vote(cNames, cVotes, cWts, "Displacement", disp / 1.2, w_disp)
+f_vote(cNames, cVotes, cWts, "Displacement", disp / 1.2, w_disp, atr > 0)
 // 8 regime bias: short gamma amplifies the prevailing move, long gamma pulls to the node
 f_vote(cNames, cVotes, cWts, "Gamma fit",
      negGamma and atr > 0 ? f_clamp((close - vwap) / (atr * 1.5))
-     : posGamma ? magnetPull : 0.0, w_gamma)
+     : posGamma ? magnetPull : 0.0, w_gamma, hasGex and not na(flipLvl))
 // 9 the magnet itself
-f_vote(cNames, cVotes, cWts, "Magnet", magnetPull, w_magnet)
+f_vote(cNames, cVotes, cWts, "Magnet", magnetPull, w_magnet, not na(magnet))
 // 10 asymmetry of space — far ceiling and near floor favours longs
-f_vote(cNames, cVotes, cWts, "Room", (nz(dRes, 3.0) - nz(dSup, 3.0)) / 2.0, w_room)
+f_vote(cNames, cVotes, cWts, "Room", (nz(dRes, 3.0) - nz(dSup, 3.0)) / 2.0, w_room, not na(resLvl) or not na(supLvl))
 // 11 opening range
 f_vote(cNames, cVotes, cWts, "Opening range",
-     na(orbHi) or na(orbLo) ? 0.0 : close > orbHi ? 1.0 : close < orbLo ? -1.0 : 0.0, w_orb)
+     na(orbHi) or na(orbLo) ? 0.0 : close > orbHi ? 1.0 : close < orbLo ? -1.0 : 0.0,
+     w_orb, not na(orbHi) and not na(orbLo))
 // 12 expected-move exhaustion — the edges of the band tend to reject on 0DTE
 f_vote(cNames, cVotes, cWts, "EM band",
-     not na(emUp) and close >= emUp ? -1.0 : not na(emDn) and close <= emDn ? 1.0 : 0.0, w_em)
+     not na(emUp) and close >= emUp ? -1.0 : not na(emDn) and close <= emDn ? 1.0 : 0.0,
+     w_em, not na(emUp) and not na(emDn))
 // 13 higher timeframe
 f_vote(cNames, cVotes, cWts, "HTF trend",
-     na(htfF) or na(htfS) or atr <= 0 ? 0.0 : (htfF - htfS) / (atr * 0.8), w_htf)
+     na(htfF) or na(htfS) or atr <= 0 ? 0.0 : (htfF - htfS) / (atr * 0.8),
+     w_htf, not na(htfF) and not na(htfS) and atr > 0)
 // 14 broad market
 f_vote(cNames, cVotes, cWts, "Context",
-     na(ctxPx) or na(ctxVwap) ? 0.0 : ctxPx > ctxVwap ? 0.6 : -0.6, w_ctx)
+     na(ctxPx) or na(ctxVwap) ? 0.0 : ctxPx > ctxVwap ? 0.6 : -0.6,
+     w_ctx, not na(ctxPx) and not na(ctxVwap))
 // 15 divergence
-f_vote(cNames, cVotes, cWts, "Divergence", bullDiv ? 1.0 : bearDiv ? -1.0 : 0.0, w_div)
+f_vote(cNames, cVotes, cWts, "Divergence", bullDiv ? 1.0 : bearDiv ? -1.0 : 0.0, w_div, true)
 
 // ── Tally ────────────────────────────────────────────────────────────────────
 float bullW = 0.0
