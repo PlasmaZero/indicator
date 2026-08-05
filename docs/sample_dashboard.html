@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GEX levels — SPY, QQQ</title>
+<title>GEX levels — SPY</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; }
 .viz-root {
@@ -122,8 +122,8 @@ body.stale .live i { background: var(--muted); animation: none; }
 <body>
 <div class="viz-root"><div class="wrap">
   <h1>Dealer gamma exposure</h1>
-  <p class="sub">Generated 2026-08-04 00:43 UTC · levels feed the Pine indicator</p>
-  <div class="tabs" role="tablist"><button class="tab" role="tab" data-sym="SPY" aria-selected="false">SPY</button><button class="tab" role="tab" data-sym="QQQ" aria-selected="false">QQQ</button></div>
+  <p class="sub">Generated 2026-08-05 22:49 UTC · levels feed the Pine indicator</p>
+  <div class="tabs" role="tablist"><button class="tab" role="tab" data-sym="SPY" aria-selected="false">SPY</button></div>
   <div class="tiles" id="tiles"></div>
   <div class="strip" id="strip"></div>
 
@@ -152,7 +152,7 @@ body.stale .live i { background: var(--muted); animation: none; }
   </div>
 </div></div>
 <script>
-let DATA = [{"symbol": "SPY", "spot": 757.63, "expiry": "2026-08-04", "net_gex": 371349886.1135622, "call_wall": 760.0, "put_wall": 750.0, "call_wall_2": 765.0, "put_wall_2": 755.0, "gamma_flip": 756.7069494504977, "control_node": 760.0, "expected_move": 4.087184274747674, "atm_iv": 0.115, "call_wall_oi": 765.0, "put_wall_oi": 750.0, "profile": [[735.0, -147.21085920330518], [740.0, -89031.06664320453], [745.0, -15063790.408537406], [750.0, -301075453.9634024], [755.0, -215425992.60262805], [758.0, 134818025.99376518], [760.0, 439509090.107244], [765.0, 317606333.20031476], [770.0, 11028601.000763519], [775.0, 42251.06354491438]], "pine_blob": "flip:756.71,cw:760,pw:750,cn:760,cw2:765,pw2:755,em:4.09,net:371.35", "pine_profile": "735=-0,740=-0.089,745=-15.064,750=-301.075,755=-215.426,758=134.818,760=439.509,765=317.606,770=11.029,775=0.042"}, {"symbol": "QQQ", "spot": 700.06, "expiry": "2026-08-04", "net_gex": -486744583.6574847, "call_wall": 705.0, "put_wall": 695.0, "call_wall_2": 702.0, "put_wall_2": 698.0, "gamma_flip": 701.2134078887086, "control_node": 695.0, "expected_move": 4.876754872038338, "atm_iv": 0.1485, "call_wall_oi": 710.0, "put_wall_oi": 695.0, "profile": [[685.0, -4440802.8124490855], [690.0, -118900581.24008076], [695.0, -721044476.1553372], [698.0, -502720480.3526344], [700.0, -29711473.223974317], [702.0, 302798568.32519984], [705.0, 458798739.2976526], [710.0, 125459770.83616018], [715.0, 3016151.66797841]], "pine_blob": "flip:701.21,cw:705,pw:695,cn:695,cw2:702,pw2:698,em:4.88,net:-486.745", "pine_profile": "685=-4.441,690=-118.901,695=-721.044,698=-502.72,700=-29.711,702=302.799,705=458.799,710=125.46,715=3.016"}];
+let DATA = [{"symbol": "SPY", "spot": 757.63, "expiry": "2026-08-04", "net_gex": 346610318.22083217, "call_wall": 760.0, "put_wall": 750.0, "call_wall_2": 765.0, "put_wall_2": 755.0, "call_wall_3": 758.0, "put_wall_3": 745.0, "gamma_flip": 756.7456427269691, "control_node": 760.0, "expected_move": 4.536671123493241, "atm_iv": 0.115, "call_wall_oi": 765.0, "put_wall_oi": 750.0, "size_mode": "oi", "profile": [[735.0, -2238.870805836511], [740.0, -440716.62291937973], [745.0, -32346474.54038495], [750.0, -370072466.75567484], [755.0, -200369890.9846146], [758.0, 121586873.68074465], [760.0, 409790779.57170504], [765.0, 393933384.3811657], [770.0, 24311380.141190547], [775.0, 219688.22042590263]], "pine_blob": "flip:756.75,cw:760,pw:750,cn:760,cw2:765,pw2:755,cw3:758,pw3:745,cwo:765,pwo:750,em:4.54,ref:757.63,net:346.61", "pine_profile": "735=-0.002,740=-0.441,745=-32.346,750=-370.072,755=-200.37,758=121.587,760=409.791,765=393.933,770=24.311,775=0.22"}];
 const LIVE = false, POLL_MS = 30000;
 let curSym = null;
 const $ = (s, r) => (r || document).querySelector(s);
@@ -330,7 +330,7 @@ function render(sym) {
   $('#tiles').innerHTML = `
     <div class="tile"><div class="k">Spot</div><div class="v">${n2(d.spot)}</div>
       <div class="n">exp ${d.expiry}</div></div>
-    <div class="tile ${posG ? 'pos' : 'neg'}"><div class="k">Regime</div>
+    <div class="tile ${d.gamma_flip == null ? '' : posG ? 'pos' : 'neg'}"><div class="k">Regime</div>
       <div class="v">${regime} γ</div><div class="n">${regimeNote}</div></div>
     <div class="tile"><div class="k">Gamma flip</div><div class="v">${n2(d.gamma_flip)}</div>
       <div class="n">regime divider</div></div>
@@ -343,6 +343,9 @@ function render(sym) {
     ['ATM IV', d.atm_iv == null ? '—' : (d.atm_iv * 100).toFixed(1) + '%'],
     ['GEX walls', n0(d.put_wall) + ' / ' + n0(d.call_wall)],
     ['OI walls', n0(d.put_wall_oi) + ' / ' + n0(d.call_wall_oi)],
+    ['Sized by', d.size_mode === 'oi' ? 'open interest'
+      : d.size_mode === 'volume' ? 'session volume'
+      : d.size_mode === 'max' ? 'max(OI, volume)' : 'OI + volume'],
   ].map(([k, v]) => `<span><b>${k}</b>${v}</span>`).join('');
 
   $('#chart').innerHTML = chart(d);

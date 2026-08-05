@@ -4,13 +4,20 @@
 import math
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import gex_engine
 from gex_engine import (
     Contract, bs_gamma, year_fraction, derive_levels, pine_blob, pine_profile,
-    strike_gex,
+    strike_gex, contract_size, resolve_size_mode, find_gamma_flip, total_gex_at,
 )
+
+# Every level in this file is time-dependent — gamma collapses into a narrower
+# and narrower band as expiry approaches, so the same chain produces different
+# walls at 09:30 and at 15:30. Pinning "now" is what makes the expectations below
+# mean anything; without it the fixture silently becomes a past expiry and the
+# whole suite starts measuring the 30-minute time floor instead of the chain.
+NOW = datetime(2026, 8, 3, 20, 14, 59, tzinfo=timezone.utc)   # 16:14 ET, 1DTE
 
 FAILS = []
 
@@ -25,7 +32,7 @@ def check(name, cond, detail=""):
 print("\nBlack-Scholes gamma")
 # Reference: live Robinhood quote for SPY 758C exp 2026-08-04, spot 757.63,
 # iv 0.112429, quoted 2026-08-03T20:14:59Z. Broker reported gamma 0.091055.
-T = year_fraction(date(2026, 8, 4), now=datetime(2026, 8, 3, 20, 14, 59, tzinfo=timezone.utc))
+T = year_fraction(date(2026, 8, 4), now=NOW)
 g = bs_gamma(757.63, 758.0, T, 0.112429)
 check("matches broker greeks within 3%", abs(g - 0.091055) / 0.091055 < 0.03,
       f"bs={g:.6f} broker=0.091055")
@@ -37,6 +44,15 @@ check("degenerate inputs return 0", bs_gamma(100, 100, 0, 0.2) == 0.0
       and bs_gamma(100, 100, 0.02, 0) == 0.0)
 check("0DTE time floor keeps T finite",
       year_fraction(date(2020, 1, 1)) > 0)
+
+# The expiry cut is 16:00 *New York*, which is a different UTC instant in summer
+# and winter. A fixed offset was an hour out for the whole EST half of the year,
+# and an hour is a large slice of the T left on a 0DTE afternoon.
+summer = year_fraction(date(2026, 8, 4), now=datetime(2026, 8, 4, 19, 0, tzinfo=timezone.utc))
+winter = year_fraction(date(2026, 1, 15), now=datetime(2026, 1, 15, 20, 0, tzinfo=timezone.utc))
+check("expiry cut tracks New York DST, not a fixed offset",
+      abs(summer - winter) < 1e-12,
+      f"1h to the cut both ways: summer={summer * 8760:.3f}h winter={winter * 8760:.3f}h")
 
 # ---------------------------------------------------------------------------
 print("\nSign convention")
@@ -65,7 +81,7 @@ for k, oi in call_oi.items():
 for k, oi in put_oi.items():
     contracts.append(Contract("put", float(k), oi, 0.118))
 
-lv = derive_levels("SPY", EXPIRY, contracts, SPOT)
+lv = derive_levels("SPY", EXPIRY, contracts, SPOT, now=NOW)
 
 check("call wall sits above spot", lv.call_wall is not None and lv.call_wall > SPOT,
       f"call_wall={lv.call_wall}")
@@ -103,11 +119,50 @@ check("profile is sorted by strike",
       [k for k, _ in lv.profile] == sorted(k for k, _ in lv.profile))
 
 # The flip is where aggregate gamma changes sign — verify by construction.
-from gex_engine import total_gex_at
-below = total_gex_at(contracts, lv.gamma_flip - 3, year_fraction(EXPIRY))
-above = total_gex_at(contracts, lv.gamma_flip + 3, year_fraction(EXPIRY))
+T_FIX = year_fraction(EXPIRY, now=NOW)
+below = total_gex_at(contracts, lv.gamma_flip - 3, T_FIX)
+above = total_gex_at(contracts, lv.gamma_flip + 3, T_FIX)
 check("aggregate gamma actually changes sign across the flip",
       (below < 0) != (above < 0), f"below={below:.3e} above={above:.3e}")
+
+# ---------------------------------------------------------------------------
+print("\nGamma flip through the session")
+# The failure this guards against: gamma more than a few percent from spot
+# underflows to exactly 0.0 in float, and a scan that reads a zero as a sign
+# change returns the bottom of its own search window. That put the flip 10%
+# below spot for the last two hours of every 0DTE session — which pins the
+# regime to "positive gamma" permanently, since price is then always above it.
+for label, hours in (("open", 6.4), ("midday", 4.0), ("power hour", 1.5),
+                     ("final 30m", 0.5)):
+    now = datetime(2026, 8, 4, 20, 0, tzinfo=timezone.utc) - timedelta(hours=hours)
+    t = year_fraction(EXPIRY, now=now)
+    flip = find_gamma_flip(contracts, SPOT, t)
+    check(f"0DTE flip stays near spot — {label}",
+          flip is not None and abs(flip - SPOT) < SPOT * 0.01,
+          f"T={t * 8760:.2f}h flip={flip}")
+
+check("a chain with no sign change reports no flip rather than inventing one",
+      find_gamma_flip([Contract("call", 760.0, 5000, 0.15)], SPOT, 0.01) is None)
+check("the flip nearest spot wins when several crossings exist",
+      abs(find_gamma_flip(contracts, SPOT, T_FIX) - SPOT) < SPOT * 0.02)
+
+# ---------------------------------------------------------------------------
+print("\nContract sizing")
+c = Contract("call", 760.0, 1000, 0.11, None, 4000)
+check("oi mode ignores volume", contract_size(c, "oi") == 1000)
+check("volume mode ignores open interest", contract_size(c, "volume") == 4000)
+check("max mode takes the larger", contract_size(c, "max") == 4000)
+check("sum mode adds them", contract_size(c, "sum") == 5000)
+# Open interest is published after the close, so on a 0DTE chain it describes
+# yesterday. Today's volume is the only view of what actually traded.
+check("auto blends volume in on a 0DTE chain",
+      resolve_size_mode("auto", date(2026, 8, 4), NOW.replace(day=4)) == "max")
+check("auto trusts open interest further out",
+      resolve_size_mode("auto", date(2026, 8, 20), NOW) == "oi")
+sized = derive_levels("SPY", EXPIRY, [c], SPOT, size_mode="max", now=NOW)
+check("size mode is recorded on the levels", sized.size_mode == "max")
+check("size mode reaches the profile",
+      sized.profile and sized.profile[0][1] > 0)
 
 # ---------------------------------------------------------------------------
 print("\nEmitters")
@@ -115,6 +170,15 @@ blob = pine_blob(lv)
 prof = pine_profile(lv)
 check("blob carries every level key",
       all(f"{k}:" in blob for k in ("flip", "cw", "pw", "cn", "em")), blob)
+# The expected move is the move remaining from the spot it was computed at, so
+# the band has to hang off that price. Without `ref` the indicator anchors it to
+# the session open, and a midday regeneration then draws a half-day band around
+# a full-day starting point.
+check("blob carries the reference spot for the expected-move band",
+      "ref:" in blob and abs(float(dict(p.split(":") for p in blob.split(","))["ref"])
+                             - lv.spot) < 0.01)
+check("blob carries the open-interest walls",
+      "cwo:" in blob and "pwo:" in blob, blob)
 check("blob has no spaces (Pine parser strips them anyway)", " " not in blob)
 check("profile pairs are strike=value", all("=" in p for p in prof.split(",")))
 check("profile is in ascending strike order",
