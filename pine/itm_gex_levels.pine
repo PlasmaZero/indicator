@@ -64,10 +64,16 @@ i_preset   = input.string("Balanced", "Signal frequency",
      tooltip = "Presets move the four gates together. Max takes almost anything with a directional lean — expect many more signals and a lower hit rate. Custom uses the fields below verbatim.")
 i_minConf  = input.int(60, "Min confidence %", minval = 20, maxval = 95, step = 5, group = G_SIG,
      tooltip = "Confidence is the weighted agreement across all confluences. 60 ≈ grade B.")
-i_minAgree = input.int(5, "Min confluences agreeing", minval = 2, maxval = 12, group = G_SIG)
+i_minAgree = input.int(3, "Min confluence families agreeing", minval = 1, maxval = 7, group = G_SIG,
+     tooltip = "Counted by family, not by confluence. Trend and HTF trend are one idea; RVOL and displacement are one idea. Requiring N families requires N genuinely separate reasons.")
 i_cooldown = input.int(5, "Cooldown bars", minval = 0, maxval = 50, group = G_SIG)
 i_regimeF  = input.bool(true, "Regime filter", group = G_SIG,
      tooltip = "In positive gamma, block longs pressed into the call wall and shorts pressed into the put wall (dealers suppress moves there).")
+i_lunchBump = input.int(10, "Lunch-hour confidence bump", minval = 0, maxval = 30, step = 5,
+     group = G_SIG,
+     tooltip = "Added to the confidence gate between 11:30 and 14:00 ET, where 5m ranges compress and signals of a given quality resolve worse than the same reading at 10:00 or 15:00.")
+i_todayOnly = input.bool(false, "Signals: current session only (with a GEX blob)", group = G_SIG,
+     tooltip = "A pasted blob is today's chain applied to every bar on the chart, so historical signals were scored against levels that did not exist yet. Turn this on and the history stops being a flattering back-fit.")
 
 // ── Confluence weights ───────────────────────────────────────────────────────
 // Each confluence casts a bull/bear/neutral vote; confidence is the weighted
@@ -104,7 +110,23 @@ i_minRR    = input.float(1.3, "Min reward:risk", minval = 0.2, step = 0.1, group
 i_stopATR  = input.float(1.1, "Stop (ATR mult)", minval = 0.2, step = 0.1, group = G_RISK)
 i_maxRiskATR = input.float(1.8, "Max risk (ATR mult)", minval = 0.3, step = 0.1, group = G_RISK,
      tooltip = "Caps the stop distance so a far-away structural level can't create an oversized loss.")
+i_stopBuf  = input.float(0.10, "Stop buffer beyond structure (ATR)", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = G_RISK,
+     tooltip = "Pushes the stop past the swing rather than sitting exactly on it, where the resting liquidity is.")
+i_fillMode = input.string("Next open", "Fill at", options = ["Next open", "Signal close"],
+     group = G_RISK,
+     tooltip = "A signal is only known once its bar has closed, so that close is not a price anyone could have traded. 'Next open' fills where you would actually get in and is the honest setting; 'Signal close' reproduces the old, flattering behaviour.")
+i_tp1Frac  = input.float(0.5, "Scale out at TP1", minval = 0.0, maxval = 1.0, step = 0.1,
+     group = G_RISK,
+     tooltip = "Fraction of the position booked at TP1. At 0 the trade is all-or-nothing and a move that reaches target then reverses books exactly 0R; at 1 it closes entirely at TP1 and never runs.")
 i_manageOn = input.bool(true, "Track trades on chart", group = G_RISK)
+i_tgtMids  = input.bool(true, "Use midpoints as targets", group = G_RISK,
+     tooltip = "Separate from the Display toggle of the same name — a visual preference should not silently move TP1.")
+i_tgtOI    = input.bool(true, "Use open-interest walls as targets", group = G_RISK,
+     tooltip = "Near expiry the gamma-weighted walls collapse onto the money. The OI walls stay out where the size is, which is usually the more tradable target.")
+i_maxMin   = input.int(120, "Time stop (minutes, 0 = off)", minval = 0, maxval = 390, step = 15,
+     group = G_RISK,
+     tooltip = "Closes a trade that has not reached TP1 in this long. One position runs at a time, so a trade going nowhere is also blocking every better setup behind it.")
 i_beAtTp1  = input.bool(true, "Move stop to breakeven at TP1", group = G_RISK)
 i_exitEOD  = input.bool(true, "Flatten at session close (0DTE)", group = G_RISK)
 i_exitFlip = input.bool(false, "Exit if score flips against the trade", group = G_RISK)
@@ -123,9 +145,11 @@ i_showStats = input.bool(true, "Session stats table", group = G_RISK)
 minConf  = i_preset == "Custom" ? i_minConf
      : i_preset == "Conservative" ? 70 : i_preset == "Balanced" ? 60
      : i_preset == "Aggressive" ? 45 : 32
+// Agreement is counted in families now (7 of them), not in raw confluences, so
+// these numbers are much smaller than the old per-confluence counts.
 minAgree = i_preset == "Custom" ? i_minAgree
-     : i_preset == "Conservative" ? 6 : i_preset == "Balanced" ? 5
-     : i_preset == "Aggressive" ? 3 : 2
+     : i_preset == "Conservative" ? 5 : i_preset == "Balanced" ? 3
+     : i_preset == "Aggressive" ? 2 : 1
 coolBars = i_preset == "Custom" ? i_cooldown
      : i_preset == "Conservative" ? 8 : i_preset == "Balanced" ? 5
      : i_preset == "Aggressive" ? 2 : 0
@@ -187,8 +211,16 @@ var float gexCW2  = f_key(i_blob, "cw2")
 var float gexPW2  = f_key(i_blob, "pw2")
 var float gexCW3  = f_key(i_blob, "cw3")
 var float gexPW3  = f_key(i_blob, "pw3")
+var float gexCWO  = f_key(i_blob, "cwo")
+var float gexPWO  = f_key(i_blob, "pwo")
 var float gexNet  = f_key(i_blob, "net")
 var float gexEM   = f_key(i_blob, "em")
+// Spot when the blob was generated. The expected move is the move *remaining*
+// from that price to the close, so the band hangs off it; anchoring to the
+// session open makes a midday regeneration draw a half-day band around a
+// full-day starting point, which is far too tight and turns confluence 12 into
+// a spurious fade generator at both edges.
+var float gexRef  = f_key(i_blob, "ref")
 
 var bool hasGex = not na(gexFlip) or not na(gexCW) or not na(gexPW)
 
@@ -276,8 +308,9 @@ cnLvl   = hasGex ? gexCN   : (i_autoOn ? poc : na)
 var float sessOpen = na
 if newDay
     sessOpen := open
-emUp = na(gexEM) or na(sessOpen) ? na : sessOpen + gexEM
-emDn = na(gexEM) or na(sessOpen) ? na : sessOpen - gexEM
+emAnchor = not na(gexRef) ? gexRef : sessOpen
+emUp = na(gexEM) or na(emAnchor) ? na : emAnchor + gexEM
+emDn = na(gexEM) or na(emAnchor) ? na : emAnchor - gexEM
 
 // Midpoints between the flip and each wall — price frequently stalls here on
 // the way from one level to the next, so they serve as targets too.
@@ -298,7 +331,10 @@ regime = not hasGex
      ? (na(flipLvl) ? "NO DATA · price-only"
         : posGamma ? "AUTO · above VWAP (no GEX)" : "AUTO · below VWAP (no GEX)")
      : posGamma ? "POSITIVE γ · mean-revert / pin"
-     : negGamma ? "NEGATIVE γ · trend / expand" : "NO GEX · price-only"
+     : negGamma ? "NEGATIVE γ · trend / expand"
+     // Walls loaded but no flip: the engine found no sign change in the chain
+     // and declined to invent one, so there is no regime to report.
+     : "GEX loaded · no flip in the chain"
 
 // =============================================================================
 //  Signal components  (each returns roughly -1 … +1)
@@ -315,6 +351,8 @@ var int rthBar = 0
 rthBar := inRth ? rthBar + 1 : 0
 tfMin    = math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
 rthTotal = math.round(390.0 / tfMin)
+// Time stop expressed in minutes so it means the same thing on any timeframe.
+maxTradeBars = i_maxMin > 0 ? math.max(1, int(math.round(i_maxMin / tfMin))) : 0
 
 f_clamp(float v) => math.max(-1.0, math.min(1.0, v))
 
@@ -402,88 +440,154 @@ magnet     = na(cnLvl) ? na : cnLvl
 magnetPull = na(magnet) or atr <= 0 ? 0.0 : f_clamp((magnet - close) / (atr * 3))
 
 // ── Voting ───────────────────────────────────────────────────────────────────
+// Every confluence belongs to a family. The fifteen reads are not fifteen
+// independent opinions: trend and HTF trend are one idea sampled twice, RVOL and
+// displacement both just describe the current bar, VWAP and market context agree
+// by construction on a SPY chart. Counting them separately let two genuine ideas
+// wearing five hats clear a "5 confluences agreeing" gate, and inflated purity
+// the same way. Votes are pooled within a family first, and the family votes once.
+F_TREND  = 1   // Trend, HTF trend
+F_FLOW   = 2   // Momentum, Delta, Divergence
+F_BAR    = 3   // RVOL, Displacement
+F_VALUE  = 4   // VWAP, Market context
+F_GAMMA  = 5   // Gamma fit, Magnet
+F_LEVEL  = 6   // Room, EM band
+F_STRUCT = 7   // Sweep, Opening range
+N_FAM    = 7
+
 cNames = array.new<string>()
 cVotes = array.new<float>()
 cWts   = array.new<float>()
+cFam   = array.new<int>()
+
+// Net GEX is the size of the whole gamma story and the flip is where that story
+// changes sign, so above the flip the net should be positive and below it
+// negative. When the two disagree the chain is saying two different things and
+// the regime is not something to lean on — that is a reason to trust the gamma
+// read less, not to quietly carry on as if it were solid.
+regimeAgrees = not hasGex or na(gexNet) or na(flipLvl) ? true : posGamma == (gexNet > 0)
+gammaTrust   = regimeAgrees ? 1.0 : 0.35
 
 // `avail` separates "this confluence has no data" from "it has data and is
 // neutral". A sweep that did not happen is real information and should dilute
 // confidence; an expected-move band that does not exist is not information at
 // all, and must stay out of the denominator entirely.
-f_vote(string[] nmA, float[] vA, float[] wA, string nm, float v, float w, bool avail) =>
+f_vote(string[] nmA, float[] vA, float[] wA, int[] fA, string nm, float v, float w,
+     int fam, bool avail) =>
     if w > 0 and avail and not na(v)
         array.push(nmA, nm)
         array.push(vA, math.max(-1.0, math.min(1.0, v)))
         array.push(wA, w)
+        array.push(fA, fam)
 
 // 1 trend, 2 momentum
-f_vote(cNames, cVotes, cWts, "Trend", atr > 0 ? (emaF - emaS) / (atr * 0.6) : 0.0, w_trend, atr > 0)
-f_vote(cNames, cVotes, cWts, "Momentum", (rsi - 50) / 20.0, w_mom, not na(rsi))
+f_vote(cNames, cVotes, cWts, cFam, "Trend", atr > 0 ? (emaF - emaS) / (atr * 0.6) : 0.0, w_trend, F_TREND, atr > 0)
+f_vote(cNames, cVotes, cWts, cFam, "Momentum", (rsi - 50) / 20.0, w_mom, F_FLOW, not na(rsi))
 // 3 participation confirms the bar's own direction
-f_vote(cNames, cVotes, cWts, "RVOL",
-     rvol > 1.15 ? (close > open ? 1.0 : -1.0) * math.min((rvol - 1.0) / 1.5, 1.0) : 0.0, w_rvol, true)
+f_vote(cNames, cVotes, cWts, cFam, "RVOL",
+     rvol > 1.15 ? (close > open ? 1.0 : -1.0) * math.min((rvol - 1.0) / 1.5, 1.0) : 0.0, w_rvol, F_BAR, true)
 // 4 order flow
-f_vote(cNames, cVotes, cWts, "Delta", cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0, w_delta, cvdNorm > 0)
+f_vote(cNames, cVotes, cWts, cFam, "Delta", cvdNorm > 0 ? cvdSlope / (cvdNorm * 1.2) : 0.0, w_delta, F_FLOW, cvdNorm > 0)
 // 5 value area
-f_vote(cNames, cVotes, cWts, "VWAP", atr > 0 ? (close - vwap) / (atr * 1.2) : 0.0, w_vwap, atr > 0 and not na(vwap))
+f_vote(cNames, cVotes, cWts, cFam, "VWAP", atr > 0 ? (close - vwap) / (atr * 1.2) : 0.0, w_vwap, F_VALUE, atr > 0 and not na(vwap))
 // 6 a failed sweep is the highest-quality single tell on this list
-f_vote(cNames, cVotes, cWts, "Sweep", sweepLo ? 1.0 : sweepHi ? -1.0 : 0.0, w_sweep, true)
+f_vote(cNames, cVotes, cWts, cFam, "Sweep", sweepLo ? 1.0 : sweepHi ? -1.0 : 0.0, w_sweep, F_STRUCT, true)
 // 7 conviction of the current bar
-f_vote(cNames, cVotes, cWts, "Displacement", disp / 1.2, w_disp, atr > 0)
+f_vote(cNames, cVotes, cWts, cFam, "Displacement", disp / 1.2, w_disp, F_BAR, atr > 0)
 // 8 regime bias: short gamma amplifies the prevailing move, long gamma pulls to the node
-f_vote(cNames, cVotes, cWts, "Gamma fit",
+f_vote(cNames, cVotes, cWts, cFam, "Gamma fit",
      negGamma and atr > 0 ? f_clamp((close - vwap) / (atr * 1.5))
-     : posGamma ? magnetPull : 0.0, w_gamma, hasGex and not na(flipLvl))
+     : posGamma ? magnetPull : 0.0, w_gamma * gammaTrust, F_GAMMA, hasGex and not na(flipLvl))
 // 9 the magnet itself
-f_vote(cNames, cVotes, cWts, "Magnet", magnetPull, w_magnet, not na(magnet))
+f_vote(cNames, cVotes, cWts, cFam, "Magnet", magnetPull, w_magnet, F_GAMMA, not na(magnet))
 // 10 asymmetry of space — far ceiling and near floor favours longs
-f_vote(cNames, cVotes, cWts, "Room", (nz(dRes, 3.0) - nz(dSup, 3.0)) / 2.0, w_room, not na(resLvl) or not na(supLvl))
+f_vote(cNames, cVotes, cWts, cFam, "Room", (nz(dRes, 3.0) - nz(dSup, 3.0)) / 2.0, w_room, F_LEVEL, not na(resLvl) or not na(supLvl))
 // 11 opening range
-f_vote(cNames, cVotes, cWts, "Opening range",
+f_vote(cNames, cVotes, cWts, cFam, "Opening range",
      na(orbHi) or na(orbLo) ? 0.0 : close > orbHi ? 1.0 : close < orbLo ? -1.0 : 0.0,
-     w_orb, not na(orbHi) and not na(orbLo))
+     w_orb, F_STRUCT, not na(orbHi) and not na(orbLo))
 // 12 expected-move exhaustion — the edges of the band tend to reject on 0DTE
-f_vote(cNames, cVotes, cWts, "EM band",
+f_vote(cNames, cVotes, cWts, cFam, "EM band",
      not na(emUp) and close >= emUp ? -1.0 : not na(emDn) and close <= emDn ? 1.0 : 0.0,
-     w_em, not na(emUp) and not na(emDn))
+     w_em, F_LEVEL, not na(emUp) and not na(emDn))
 // 13 higher timeframe
-f_vote(cNames, cVotes, cWts, "HTF trend",
+f_vote(cNames, cVotes, cWts, cFam, "HTF trend",
      na(htfF) or na(htfS) or atr <= 0 ? 0.0 : (htfF - htfS) / (atr * 0.8),
-     w_htf, not na(htfF) and not na(htfS) and atr > 0)
+     w_htf, F_TREND, not na(htfF) and not na(htfS) and atr > 0)
 // 14 broad market
-f_vote(cNames, cVotes, cWts, "Context",
+f_vote(cNames, cVotes, cWts, cFam, "Context",
      na(ctxPx) or na(ctxVwap) ? 0.0 : ctxPx > ctxVwap ? 0.6 : -0.6,
-     w_ctx, not na(ctxPx) and not na(ctxVwap))
+     w_ctx, F_VALUE, not na(ctxPx) and not na(ctxVwap))
 // 15 divergence
-f_vote(cNames, cVotes, cWts, "Divergence", bullDiv ? 1.0 : bearDiv ? -1.0 : 0.0, w_div, true)
+f_vote(cNames, cVotes, cWts, cFam, "Divergence", bullDiv ? 1.0 : bearDiv ? -1.0 : 0.0, w_div, F_FLOW, true)
 
 // ── Tally ────────────────────────────────────────────────────────────────────
+// First pass: how big is each family, and which way does it lean.
+famNum = array.new<float>(N_FAM, 0.0)   // Σ w·v within the family — neutrals add nothing
+famW   = array.new<float>(N_FAM, 0.0)   // Σ w within the family
+famN   = array.new<int>(N_FAM, 0)       // members with data
+famAct = array.new<bool>(N_FAM, false)  // at least one member actually has an opinion
+
+if array.size(cVotes) > 0
+    for i = 0 to array.size(cVotes) - 1
+        fi = array.get(cFam, i) - 1
+        w  = array.get(cWts, i)
+        v  = array.get(cVotes, i)
+        array.set(famNum, fi, array.get(famNum, fi) + w * v)
+        array.set(famW,   fi, array.get(famW, fi) + w)
+        array.set(famN,   fi, array.get(famN, fi) + 1)
+        if math.abs(v) > 0.15
+            array.set(famAct, fi, true)
+
+// Redundancy damping. Three confluences reading the same thing are not three
+// independent reasons, but they are more evidence than one — so every member of
+// an n-strong family has its weight scaled by 1/√n. That charges for the overlap
+// without either double-counting the full sum or throwing the corroboration
+// away, and it is the same reasoning as the √ on participation below.
+//
+// The damping is applied per confluence rather than to a family average, so a
+// lone strong read is not diluted by silent siblings: a liquidity sweep with a
+// neutral opening range is still a sweep. Neutral members cost participation,
+// which is where the penalty for a quiet tape belongs.
 float bullW = 0.0
 float bearW = 0.0
 float totW  = 0.0
-int   nBull = 0
-int   nBear = 0
+int   nLive = 0
+for fi = 0 to N_FAM - 1
+    if array.get(famW, fi) > 0
+        nLive += 1
+        totW += array.get(famW, fi) / math.sqrt(array.get(famN, fi))
+
 if array.size(cVotes) > 0
     for i = 0 to array.size(cVotes) - 1
-        v = array.get(cVotes, i)
-        w = array.get(cWts, i)
-        totW += w
+        fi = array.get(cFam, i) - 1
+        v  = array.get(cVotes, i)
+        ew = array.get(cWts, i) / math.sqrt(array.get(famN, fi))
         if v > 0.15
-            bullW += w * v
-            nBull += 1
+            bullW += ew * v
         else if v < -0.15
-            bearW += w * (-v)
+            bearW += ew * (-v)
+
+// Agreement is counted once per family, on the side its members net out to —
+// so "3 agreeing" means three separate ideas, not one idea sampled three times.
+int nBull = 0
+int nBear = 0
+for fi = 0 to N_FAM - 1
+    if array.get(famAct, fi)
+        if array.get(famNum, fi) > 0
+            nBull += 1
+        else if array.get(famNum, fi) < 0
             nBear += 1
 
 // Confidence is two separate things multiplied together:
-//   purity        — of the confluences that have an opinion, how one-sided is it
+//   purity        — of the families that have an opinion, how one-sided is it
 //   participation — how much of the available evidence has an opinion at all
-// Dividing straight through by totW (the old formula) is purity x participation,
-// which double-counts the penalty: neutral confluences shrink the numerator AND
-// votes are magnitude-scaled, so even a solid 9-confluence trend only scored
-// ~43% and the 60% gate was effectively unreachable. Participation is softened
-// with a square root so a genuine setup can clear the gate while two weak votes
-// on their own still cannot.
+// Dividing straight through by totW (the original formula) is purity x
+// participation, which double-counts the penalty: neutral families shrink the
+// numerator AND votes are magnitude-scaled, so even a solid trend scored ~43%
+// and the 60% gate was effectively unreachable. Participation is softened with
+// a square root so a genuine setup can clear the gate while two weak votes on
+// their own still cannot.
 actW       = bullW + bearW
 purity     = actW > 0 ? (bullW - bearW) / actW : 0.0
 partic     = totW > 0 ? actW / totW : 0.0
@@ -509,85 +613,108 @@ sessionOk = not i_rthOnly or inRth
 openOk    = inRth ? rthBar > i_skipOpen : not i_rthOnly
 eodOk     = inRth ? rthBar <= rthTotal - i_skipEOD : not i_rthOnly
 
+// A pasted blob is one snapshot of today's chain, but the indicator applies it
+// to every bar of loaded history — so every historical signal was scored against
+// levels that did not exist when those bars printed. The triangles are still
+// worth seeing as a sanity check on the confluence logic; they are not evidence,
+// and this gate lets you stop them pretending to be.
+curSession  = year(time, syminfo.timezone) == year(timenow, syminfo.timezone)
+     and dayofyear(time, syminfo.timezone) == dayofyear(timenow, syminfo.timezone)
+scopeOk     = not (i_todayOnly and hasGex) or curSession
+
+// Midday. Ranges compress, levels stop being defended with any conviction, and a
+// reading that would resolve at 10:00 chops out instead. Raising the bar is
+// cheaper than a hard block: a genuinely strong setup still gets through.
+lunch      = not na(time(timeframe.period, "1130-1400", "America/New_York"))
+effMinConf = minConf + (lunch ? i_lunchBump : 0)
+
 // ── Trade construction ───────────────────────────────────────────────────────
 // Targets are real GEX levels, not ATR guesses: price tends to travel between
 // walls and stall at them, so the levels themselves are the natural exits.
-f_levelPool() =>
+// Levels are pushed through a de-duplicating helper. Distinct names routinely
+// resolve to the same price — the control node sits on a wall whenever the
+// heaviest-gamma strike is also the heaviest above spot, which is most 0DTE
+// afternoons — and a pool holding that price twice hands TP1 and TP2 the same
+// number. TP2 then triggers on the touch that made TP1, so the runner the whole
+// breakeven mechanic exists to protect never gets to run.
+f_push(float[] arr, float v, float tol) =>
+    if not na(v)
+        bool dup = false
+        if array.size(arr) > 0
+            for i = 0 to array.size(arr) - 1
+                if math.abs(array.get(arr, i) - v) <= tol
+                    dup := true
+        if not dup
+            array.push(arr, v)
+
+f_levelPool(float tol) =>
     arr = array.new<float>()
-    if not na(cwLvl)
-        array.push(arr, cwLvl)
-    if not na(gexCW2)
-        array.push(arr, gexCW2)
-    if not na(pwLvl)
-        array.push(arr, pwLvl)
-    if not na(gexPW2)
-        array.push(arr, gexPW2)
-    if not na(gexCW3)
-        array.push(arr, gexCW3)
-    if not na(gexPW3)
-        array.push(arr, gexPW3)
-    if i_showMids and not na(midUp)
-        array.push(arr, midUp)
-    if i_showMids and not na(midDn)
-        array.push(arr, midDn)
-    if not na(cnLvl)
-        array.push(arr, cnLvl)
-    if not na(flipLvl)
-        array.push(arr, flipLvl)
-    if not na(emUp)
-        array.push(arr, emUp)
-    if not na(emDn)
-        array.push(arr, emDn)
+    f_push(arr, cwLvl, tol)
+    f_push(arr, gexCW2, tol)
+    f_push(arr, pwLvl, tol)
+    f_push(arr, gexPW2, tol)
+    f_push(arr, gexCW3, tol)
+    f_push(arr, gexPW3, tol)
+    if i_tgtOI
+        f_push(arr, gexCWO, tol)
+        f_push(arr, gexPWO, tol)
+    if i_tgtMids
+        f_push(arr, midUp, tol)
+        f_push(arr, midDn, tol)
+    f_push(arr, cnLvl, tol)
+    f_push(arr, flipLvl, tol)
+    f_push(arr, emUp, tol)
+    f_push(arr, emDn, tol)
     if not hasGex
         // auto mode: fall back to structural levels so targets still exist
-        if not na(pdh)
-            array.push(arr, pdh)
-        if not na(pdl)
-            array.push(arr, pdl)
-        if not na(onh)
-            array.push(arr, onh)
-        if not na(onl)
-            array.push(arr, onl)
+        f_push(arr, pdh, tol)
+        f_push(arr, pdl, tol)
+        f_push(arr, onh, tol)
+        f_push(arr, onl, tol)
     array.sort(arr, order.ascending)
     arr
 
-// The nth level beyond `px` in the trade's direction, ignoring anything closer
-// than minGap so TP1 is never a few ticks away.
-f_targetN(float px, bool up, int n, float minGap) =>
-    pool = f_levelPool()
-    float out = na
-    int found = 0
+// The first two levels beyond `px` in the trade's direction, each at least
+// `gap` past the one before it — so TP1 is never a few ticks away and TP2 is
+// never TP1 wearing a different label.
+f_targets(float px, bool up, float gap, float tol) =>
+    pool = f_levelPool(tol)
+    float t1 = na
+    float t2 = na
     if array.size(pool) > 0
         if up
             for i = 0 to array.size(pool) - 1
                 v = array.get(pool, i)
-                if v > px + minGap and na(out)
-                    found += 1
-                    if found == n
-                        out := v
+                if na(t1) and v > px + gap
+                    t1 := v
+                else if not na(t1) and na(t2) and v > t1 + gap
+                    t2 := v
         else
             for i = array.size(pool) - 1 to 0
                 v = array.get(pool, i)
-                if v < px - minGap and na(out)
-                    found += 1
-                    if found == n
-                        out := v
-    out
+                if na(t1) and v < px - gap
+                    t1 := v
+                else if not na(t1) and na(t2) and v < t1 - gap
+                    t2 := v
+    [t1, t2]
 
 minGap = atr * 0.35
-longTp1  = f_targetN(close, true,  1, minGap)
-longTp2  = f_targetN(close, true,  2, minGap)
-shortTp1 = f_targetN(close, false, 1, minGap)
-shortTp2 = f_targetN(close, false, 2, minGap)
+// Two levels closer together than this are the same level as far as a target is
+// concerned. Tick-level equality alone would miss a node a cent off a wall.
+lvlTol = math.max(syminfo.mintick, atr * 0.08)
+[longTp1, longTp2]   = f_targets(close, true,  minGap, lvlTol)
+[shortTp1, shortTp2] = f_targets(close, false, minGap, lvlTol)
 
 // No level in range — fall back to a measured move so a trade is still definable.
 longTgt  = na(longTp1)  ? close + atr * 2.0 : longTp1
 shortTgt = na(shortTp1) ? close - atr * 2.0 : shortTp1
 
-// Stop sits beyond structure, then risk is capped so a distant level can't
-// create an oversized loss.
-rawLongStop  = math.min(ta.lowest(low, 5), close - atr * i_stopATR)
-rawShortStop = math.max(ta.highest(high, 5), close + atr * i_stopATR)
+// Stop sits beyond structure — past the swing by a buffer rather than exactly
+// on it, since resting liquidity sits at the swing and a stop parked there gets
+// taken by the noise it was meant to survive. Risk is then capped so a distant
+// level can't create an oversized loss.
+rawLongStop  = math.min(ta.lowest(low, 5) - atr * i_stopBuf, close - atr * i_stopATR)
+rawShortStop = math.max(ta.highest(high, 5) + atr * i_stopBuf, close + atr * i_stopATR)
 longStop  = math.max(rawLongStop,  close - atr * i_maxRiskATR)
 shortStop = math.min(rawShortStop, close + atr * i_maxRiskATR)
 
@@ -605,14 +732,14 @@ pinned = i_pinGuard and posGamma and hasGex and lateSession
      and not na(cnLvl) and atr > 0 and math.abs(close - cnLvl) < atr * 0.35
 
 var int lastSig = -1000
-canFire = i_sigOn and sessionOk and openOk and eodOk and barstate.isconfirmed
+canFire = i_sigOn and sessionOk and openOk and eodOk and scopeOk and barstate.isconfirmed
      and (bar_index - lastSig) > coolBars and not pinned
 
-// A trade needs a confident lean AND enough separate confluences behind it —
-// one dominant weight shouldn't be able to carry a signal on its own.
-buySig  = canFire and score > 0 and confidence >= minConf and nAgree >= minAgree
+// A trade needs a confident lean AND enough separate families behind it — one
+// dominant weight, or one idea counted several times, shouldn't carry a signal.
+buySig  = canFire and score > 0 and confidence >= effMinConf and nAgree >= minAgree
      and longRR >= minRR and not blockLong
-sellSig = canFire and score < 0 and confidence >= minConf and nAgree >= minAgree
+sellSig = canFire and score < 0 and confidence >= effMinConf and nAgree >= minAgree
      and shortRR >= minRR and not blockShort
 
 if buySig or sellSig
@@ -629,6 +756,7 @@ var float tTp2    = na
 var float tRisk   = na       // initial risk per unit, for R multiples
 var int   tBar    = na
 var bool  tTp1Hit = false
+var float tBookedR = 0.0     // R already realised by the scale-out at TP1
 var int    tConf  = 0        // confidence at entry, frozen for the label
 var string tGrade = ""
 var int    tAgree = 0
@@ -636,40 +764,93 @@ var int    tAgree = 0
 var int   nWin = 0
 var int   nLoss = 0
 var float sumR = 0.0
+var int   nSkip = 0          // pending entries a gap made untradable
 if newDay
     nWin := 0
     nLoss := 0
     sumR := 0.0
+    nSkip := 0
 
 // Only one position at a time — these are 5m intraday signals, not a portfolio.
-flat = tDir == 0
-openLong  = flat and buySig  and i_manageOn
-openShort = flat and sellSig and i_manageOn
+//
+// A signal is only known once its bar has closed, so that close is not a price
+// anyone could have traded on it. In "Next open" mode the signal arms a pending
+// entry and the fill lands on the next bar's open — the first price actually
+// available. It costs the gap, which is the point: signals cluster on
+// displacement bars, and that gap is a real, systematic cost the close-fill
+// model quietly handed back.
+nextOpen = i_fillMode == "Next open"
 
-if openLong
-    tConf := conf10
-    tGrade := grade
-    tAgree := nAgree
-    tDir := 1
-    tEntry := close
-    tStop := longStop
-    tTp1 := longTgt
-    tTp2 := na(longTp2) ? longTgt + atr : longTp2
-    tRisk := math.max(close - longStop, syminfo.mintick)
-    tBar := bar_index
-    tTp1Hit := false
-if openShort
-    tConf := conf10
-    tGrade := grade
-    tAgree := nAgree
-    tDir := -1
-    tEntry := close
-    tStop := shortStop
-    tTp1 := shortTgt
-    tTp2 := na(shortTp2) ? shortTgt - atr : shortTp2
-    tRisk := math.max(shortStop - close, syminfo.mintick)
-    tBar := bar_index
-    tTp1Hit := false
+var int    pDir   = 0        // armed signal waiting for the next open
+var float  pStop  = na
+var float  pTp1   = na
+var float  pTp2   = na
+var int    pConf  = 0
+var string pGrade = ""
+var int    pAgree = 0
+
+int    openDir  = 0
+float  openPx   = na
+float  useStop  = na
+float  useTp1   = na
+float  useTp2   = na
+int    useConf  = 0
+string useGrade = ""
+int    useAgree = 0
+
+sigStop  = buySig ? longStop : shortStop
+sigTp1   = buySig ? longTgt  : shortTgt
+sigTp2   = buySig ? (na(longTp2)  ? longTgt + atr  : longTp2)
+     : (na(shortTp2) ? shortTgt - atr : shortTp2)
+
+if i_manageOn and tDir == 0
+    if nextOpen and pDir != 0
+        px   = open
+        risk = pDir == 1 ? px - pStop : pStop - px
+        rew  = pDir == 1 ? pTp1 - px  : px - pTp1
+        // The plan was earned at the signal. A gap that jumps the stop or eats
+        // the reward:risk is not that plan any more, and taking it anyway is how
+        // a decent signal becomes a bad trade.
+        if risk > 0 and rew > 0 and rew / risk >= minRR
+            openDir  := pDir
+            openPx   := px
+            useStop  := pStop
+            useTp1   := pTp1
+            useTp2   := pTp2
+            useConf  := pConf
+            useGrade := pGrade
+            useAgree := pAgree
+        else
+            nSkip += 1
+    else if not nextOpen and (buySig or sellSig)
+        openDir  := buySig ? 1 : -1
+        openPx   := close
+        useStop  := sigStop
+        useTp1   := sigTp1
+        useTp2   := sigTp2
+        useConf  := conf10
+        useGrade := grade
+        useAgree := nAgree
+
+if nextOpen
+    pDir := 0                                // an armed signal is good for one bar
+
+openLong  = openDir == 1
+openShort = openDir == -1
+
+if openDir != 0
+    tDir     := openDir
+    tEntry   := openPx
+    tStop    := useStop
+    tTp1     := useTp1
+    tTp2     := useTp2
+    tConf    := useConf
+    tGrade   := useGrade
+    tAgree   := useAgree
+    tRisk    := math.max(openDir == 1 ? openPx - useStop : useStop - openPx, syminfo.mintick)
+    tBar     := bar_index
+    tTp1Hit  := false
+    tBookedR := 0.0
 
 // Resolve an open trade. Stop is checked before target: if a bar spans both we
 // cannot know which came first intrabar, so assume the loss.
@@ -683,22 +864,33 @@ if tDir != 0 and not openLong and not openShort
     hitTp2  = isLong ? high >= tTp2 : low <= tTp2
     hitTp1  = isLong ? high >= tTp1 : low <= tTp1
 
+    // Booking the scale-out at TP1. Without it a trade that reaches its target
+    // and then reverses to breakeven scores exactly 0R — neither what a trader
+    // would have done nor an honest account of what the setup produced.
+    tp1R = math.abs(tTp1 - tEntry) / tRisk
+
     if hitStop
         exitReason := tTp1Hit and i_beAtTp1 ? "BE" : "STOP"
         exitPrice := tStop
     else if hitTp2
+        if hitTp1 and not tTp1Hit        // a bar spanning both took TP1 on the way
+            tTp1Hit := true
+            tBookedR := i_tp1Frac * tp1R
         exitReason := "TP2"
         exitPrice := tTp2
     else
         if hitTp1 and not tTp1Hit
             tTp1Hit := true
-            if i_beAtTp1
+            tBookedR := i_tp1Frac * tp1R
+            if i_tp1Frac >= 0.999
+                exitReason := "TP1"      // nothing left to run
+                exitPrice := tTp1
+            else if i_beAtTp1
                 tStop := tEntry          // risk removed, let TP2 run
-        if i_exitFlip and barstate.isconfirmed
+        if i_exitFlip and barstate.isconfirmed and na(exitReason)
              and ((isLong and score <= -thrScore) or (not isLong and score >= thrScore))
             exitReason := "FLIP"
             exitPrice := close
-        // 0DTE contracts decay to nothing overnight — never hold past the close.
         // A signal against an open trade is otherwise discarded entirely, since
         // only one position runs at a time. Closing on it frees the slot for
         // the next bar.
@@ -706,12 +898,20 @@ if tDir != 0 and not openLong and not openShort
              and ((isLong and sellSig) or (not isLong and buySig))
             exitReason := "REV"
             exitPrice := close
+        // Not working, and holding the only slot there is while it doesn't.
+        if maxTradeBars > 0 and na(exitReason) and not tTp1Hit
+             and bar_index - tBar >= maxTradeBars
+            exitReason := "TIME"
+            exitPrice := close
+        // 0DTE contracts decay to nothing overnight — never hold past the close.
         if i_exitEOD and inRth and rthBar >= rthTotal - i_skipEOD and na(exitReason)
             exitReason := "EOD"
             exitPrice := close
 
 if not na(exitReason)
-    exitR := tDir == 1 ? (exitPrice - tEntry) / tRisk : (tEntry - exitPrice) / tRisk
+    // Whatever was not scaled out at TP1 is the runner, and it exits here.
+    raw = tDir == 1 ? (exitPrice - tEntry) / tRisk : (tEntry - exitPrice) / tRisk
+    exitR := tBookedR + (tTp1Hit ? 1.0 - i_tp1Frac : 1.0) * raw
     sumR += exitR
     if exitR > 0
         nWin += 1
@@ -759,6 +959,12 @@ f_add(gexCW2, c_call, color.white, 1.4, 12, i_showWall and not i_minimal and not
 f_add(gexPW2, c_put,  color.white, 1.4, 12, i_showWall and not i_minimal and not na(gexPW2), "PW2")
 f_add(gexCW3, c_call, color.white, 1.0, 22, i_showWall and not i_minimal and not na(gexCW3), "CW3")
 f_add(gexPW3, c_put,  color.white, 1.0, 22, i_showWall and not i_minimal and not na(gexPW3), "PW3")
+
+// Raw open-interest walls. Near expiry gamma is so peaked at the money that the
+// gamma-weighted walls collapse onto spot and stop being targets anything can
+// travel to; these stay out where the size actually sits.
+f_add(gexCWO, c_call, color.white, 1.2, 16, i_showWall and not i_minimal and not na(gexCWO), "CW·OI")
+f_add(gexPWO, c_put,  color.white, 1.2, 16, i_showWall and not i_minimal and not na(gexPWO), "PW·OI")
 
 // Midpoints, expected move, session references
 f_add(midUp, c_call, color.white, 0.7, 38, i_showMids and not i_minimal and not na(midUp), "MID")
@@ -968,7 +1174,7 @@ if openLong or openShort
          "  (" + str.tostring(math.abs(tTp1 - tEntry) / tRisk, "#.#") + "R)" +
          "\ntp2 "  + str.tostring(tTp2, format.mintick) +
          "\n" + (posGamma ? "γ+" : negGamma ? "γ−" : "γ?") +
-         " · " + str.tostring(tAgree) + " agree · RVOL " + str.tostring(rvol, "#.#"),
+         " · " + str.tostring(tAgree) + " families · RVOL " + str.tostring(rvol, "#.#"),
          style = isLong ? label.style_label_upper_right : label.style_label_lower_right,
          color = color.new(isLong ? C_WIN : C_LOSS, 15),
          textcolor = isLong ? color.black : color.white, size = size.small)
@@ -1019,6 +1225,20 @@ if not na(exitReason)
     tTp1 := na
     tTp2 := na
     tTp1Hit := false
+    tBookedR := 0.0
+
+// Arm the next bar's entry. This sits after the exit so a reversal signal that
+// just closed a position can arm the trade in the other direction on the same
+// bar it fired — otherwise the signal that triggered the REV exit would be spent
+// closing the old trade and never taken.
+if nextOpen and i_manageOn and tDir == 0 and (buySig or sellSig)
+    pDir   := buySig ? 1 : -1
+    pStop  := sigStop
+    pTp1   := sigTp1
+    pTp2   := sigTp2
+    pConf  := conf10
+    pGrade := grade
+    pAgree := nAgree
 
 // =============================================================================
 //  HUD — one compact card: what the confluences say, and where price can go
@@ -1037,11 +1257,10 @@ f_confList() =>
     s == "" ? "no confluence active" : str.substring(s, 0, str.length(s) - 1)
 
 if i_hud and barstate.islast
-    waiting = confidence < minConf or nAgree < minAgree
+    waiting = confidence < effMinConf or nAgree < minAgree
     dirTxt  = waiting ? "◆  WAIT" : score > 0 ? "▲  LONG BIAS" : "▼  SHORT BIAS"
     dirCol  = waiting ? color.gray : score > 0 ? C_WIN : C_LOSS
 
-    int rows = i_hudDetail ? 7 : 6
     var table t = table.new(position.top_right, 1, 7, border_width = 0,
          frame_color = color.new(color.gray, 60), frame_width = 1)
 
@@ -1051,15 +1270,20 @@ if i_hud and barstate.islast
          bgcolor = color.new(dirCol, waiting ? 80 : 10),
          text_size = size.normal, text_halign = text.align_left)
 
-    // confidence meter + grade
+    // confidence meter + grade. Agreement is families, not raw confluences —
+    // "3/7" is three separate reasons, which is what the gate is actually about.
     table.cell(t, 0, 1, f_dots(conf10) + "  " + str.tostring(confidence) + "%  " + grade +
-         " · " + str.tostring(nAgree) + "/" + str.tostring(array.size(cVotes)) + " agree",
+         " · " + str.tostring(nAgree) + "/" + str.tostring(nLive) + " families" +
+         (lunch and i_lunchBump > 0 ? "  ·  lunch +" + str.tostring(i_lunchBump) : ""),
          text_color = dirCol, bgcolor = color.new(color.black, 85),
          text_size = size.small, text_halign = text.align_left)
 
-    // regime
-    table.cell(t, 0, 2, regime,
-         text_color = not hasGex ? color.gray : posGamma ? c_call : c_put,
+    // regime, with the net GEX behind it — and a warning when the two disagree
+    table.cell(t, 0, 2, regime +
+         (hasGex and not na(gexNet) ? "   net " + str.tostring(gexNet, "#.#") + "M" : "") +
+         (regimeAgrees ? "" : "  ⚠ net contradicts flip"),
+         text_color = not regimeAgrees ? color.orange
+              : not hasGex ? color.gray : posGamma ? c_call : c_put,
          bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_left)
 
     // the path: nearest level each way
@@ -1087,7 +1311,7 @@ if i_hud and barstate.islast
          text_size = size.tiny, text_halign = text.align_left)
 // Session scorecard — today's closed trades only, reset each day.
 if i_showStats and i_manageOn and barstate.islast
-    var table st = table.new(position.bottom_right, 2, 4, border_width = 1)
+    var table st = table.new(position.bottom_right, 2, 6, border_width = 1)
     nTot = nWin + nLoss
     table.cell(st, 0, 0, "TRADES", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
     table.cell(st, 1, 0, str.tostring(nTot) + (tDir != 0 ? "  (1 open)" : ""),
@@ -1101,6 +1325,16 @@ if i_showStats and i_manageOn and barstate.islast
     table.cell(st, 0, 3, "TOTAL R", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
     table.cell(st, 1, 3, str.tostring(sumR, "+0.00;-0.00"),
          text_color = sumR >= 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
+    // Expectancy per trade is the number that decides whether the settings are
+    // worth running; total R just tells you how busy the day was.
+    table.cell(st, 0, 4, "AVG R", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(st, 1, 4, nTot > 0 ? str.tostring(sumR / nTot, "+0.00;-0.00") : "—",
+         text_color = sumR >= 0 ? #00e676 : #ff1744, text_size = size.tiny, text_halign = text.align_right)
+    // Signals that never became trades because the next open had already gapped
+    // past the plan. A high count means the entry model is the binding constraint.
+    table.cell(st, 0, 5, "GAPPED", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(st, 1, 5, str.tostring(nSkip),
+         text_color = color.gray, text_size = size.tiny, text_halign = text.align_right)
 
 // =============================================================================
 //  Alerts

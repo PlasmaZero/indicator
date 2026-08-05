@@ -307,7 +307,7 @@ function render(sym) {
   $('#tiles').innerHTML = `
     <div class="tile"><div class="k">Spot</div><div class="v">${n2(d.spot)}</div>
       <div class="n">exp ${d.expiry}</div></div>
-    <div class="tile ${posG ? 'pos' : 'neg'}"><div class="k">Regime</div>
+    <div class="tile ${d.gamma_flip == null ? '' : posG ? 'pos' : 'neg'}"><div class="k">Regime</div>
       <div class="v">${regime} γ</div><div class="n">${regimeNote}</div></div>
     <div class="tile"><div class="k">Gamma flip</div><div class="v">${n2(d.gamma_flip)}</div>
       <div class="n">regime divider</div></div>
@@ -320,6 +320,9 @@ function render(sym) {
     ['ATM IV', d.atm_iv == null ? '—' : (d.atm_iv * 100).toFixed(1) + '%'],
     ['GEX walls', n0(d.put_wall) + ' / ' + n0(d.call_wall)],
     ['OI walls', n0(d.put_wall_oi) + ' / ' + n0(d.call_wall_oi)],
+    ['Sized by', d.size_mode === 'oi' ? 'open interest'
+      : d.size_mode === 'volume' ? 'session volume'
+      : d.size_mode === 'max' ? 'max(OI, volume)' : 'OI + volume'],
   ].map(([k, v]) => `<span><b>${k}</b>${v}</span>`).join('');
 
   $('#chart').innerHTML = chart(d);
