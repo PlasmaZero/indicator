@@ -465,7 +465,7 @@ cFam   = array.new<int>()
 // negative. When the two disagree the chain is saying two different things and
 // the regime is not something to lean on — that is a reason to trust the gamma
 // read less, not to quietly carry on as if it were solid.
-regimeAgrees = not hasGex or na(gexNet) or na(flipLvl) ? true : posGamma == (gexNet > 0)
+regimeAgrees = (not hasGex or na(gexNet) or na(flipLvl)) ? true : posGamma == (gexNet > 0)
 gammaTrust   = regimeAgrees ? 1.0 : 0.35
 
 // `avail` separates "this confluence has no data" from "it has data and is
@@ -619,7 +619,8 @@ eodOk     = inRth ? rthBar <= rthTotal - i_skipEOD : not i_rthOnly
 // worth seeing as a sanity check on the confluence logic; they are not evidence,
 // and this gate lets you stop them pretending to be.
 curSession  = year(time, syminfo.timezone) == year(timenow, syminfo.timezone)
-     and dayofyear(time, syminfo.timezone) == dayofyear(timenow, syminfo.timezone)
+     and month(time, syminfo.timezone) == month(timenow, syminfo.timezone)
+     and dayofmonth(time, syminfo.timezone) == dayofmonth(timenow, syminfo.timezone)
 scopeOk     = not (i_todayOnly and hasGex) or curSession
 
 // Midday. Ranges compress, levels stop being defended with any conviction, and a
