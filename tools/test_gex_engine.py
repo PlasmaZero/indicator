@@ -283,6 +283,51 @@ finally:
     gex_engine.load_yfinance = _orig_loader
 
 # ---------------------------------------------------------------------------
+print("\nLive server resilience")
+# One symbol failing used to discard the whole batch, so a momentary 404 on IWM
+# blanked SPY as well. Each symbol keeps its own last good snapshot now.
+_fail = {"on": False}
+
+
+def _flaky(sym, dte):
+    if sym == "BAD" or _fail["on"]:
+        raise RuntimeError("chain unavailable")
+    return ([Contract("call", 105.0, 900, 0.2), Contract("put", 95.0, 900, 0.2)],
+            100.0, date(2026, 8, 4))
+
+
+_saved = gex_engine.load_yfinance
+gex_engine.load_yfinance = _flaky
+try:
+    port2 = 8801
+    threading.Thread(target=lambda: gex_engine.run_server(["SPY", "BAD"], 0, port2, 3),
+                     daemon=True).start()
+    deadline = time.time() + 20
+    api = None
+    while time.time() < deadline:
+        try:
+            api = _json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port2}/api/levels", timeout=2).read())
+            break
+        except Exception:
+            time.sleep(0.4)
+    check("a failing symbol does not take the healthy ones down with it",
+          api is not None and len(api["levels"]) == 1
+          and api["levels"][0]["symbol"] == "SPY",
+          str(api and [l["symbol"] for l in api["levels"]]))
+    check("the failure is reported rather than swallowed",
+          api is not None and api["error"] and "BAD" in api["error"], str(api and api["error"]))
+    # Now break everything: the last good snapshot has to survive.
+    _fail["on"] = True
+    time.sleep(4)
+    api2 = _json.loads(urllib.request.urlopen(
+        f"http://127.0.0.1:{port2}/api/levels", timeout=2).read())
+    check("stale data keeps serving when every refresh fails",
+          len(api2["levels"]) == 1 and api2["levels"][0]["symbol"] == "SPY")
+finally:
+    gex_engine.load_yfinance = _saved
+
+# ---------------------------------------------------------------------------
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILED: {', '.join(FAILS)}")

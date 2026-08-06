@@ -264,12 +264,19 @@ else
     dLo := math.min(nz(dLo, low), low)
 
 inRth = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+
+// Overnight runs from one session's close to the next one's open. Resetting on
+// the calendar day boundary threw away the post-close hours and kept only the
+// pre-market, so "ONH" was never the overnight high — it was the 04:00-09:30
+// high. Resetting when RTH ends captures the whole gap, and the levels then sit
+// frozen through the session, which is what they are for.
+rthEnded = not inRth and inRth[1]
 var float onh = na
 var float onl = na
-if newDay
-    onh := na
-    onl := na
-if not inRth
+if rthEnded
+    onh := high
+    onl := low
+else if not inRth
     onh := na(onh) ? high : math.max(onh, high)
     onl := na(onl) ? low  : math.min(onl, low)
 
@@ -603,7 +610,6 @@ f_dots(int n) =>
     for i = 1 to 10
         s := s + (i <= n ? "●" : "○")
     s
-thrScore   = minConf / 100.0
 
 // =============================================================================
 //  Signal gating
@@ -628,6 +634,10 @@ scopeOk     = not (i_todayOnly and hasGex) or curSession
 // cheaper than a hard block: a genuinely strong setup still gets through.
 lunch      = not na(time(timeframe.period, "1130-1400", "America/New_York"))
 effMinConf = minConf + (lunch ? i_lunchBump : 0)
+// The score a reversal has to reach to close a trade on FLIP. It tracks the
+// effective gate, so midday noise can't knock a position out on a reading that
+// would not have been allowed to open one.
+thrScore   = effMinConf / 100.0
 
 // ── Trade construction ───────────────────────────────────────────────────────
 // Targets are real GEX levels, not ATR guesses: price tends to travel between
@@ -945,9 +955,17 @@ f_add(float p, color c, color tc, float w, int d, bool show, string t) =>
 
 C_DIM = #8a8f98
 
+// Prior close means the prior *regular-hours* close. `close[1]` at the day
+// boundary is the last bar of the previous chart day, which on an
+// extended-hours chart is the 20:00 print rather than the 16:00 one traders
+// mean. Latching the running RTH close before it updates gets the right bar on
+// both chart types.
+var float rthClose = na
 var float pdc = na
 if newDay
-    pdc := close[1]
+    pdc := rthClose
+if inRth
+    rthClose := close
 
 // Majors — full opacity, heaviest halo
 f_add(cwLvl,   c_call, color.white, 3.0, 0, i_showWall and not na(cwLvl),  hasGex ? "CALL WALL" : "PDH")
@@ -1244,17 +1262,26 @@ if nextOpen and i_manageOn and tDir == 0 and (buySig or sellSig)
 // =============================================================================
 //  HUD — one compact card: what the confluences say, and where price can go
 // =============================================================================
-// The confluences currently voting, strongest first is not worth a sort here —
-// declaration order already runs roughly most- to least-structural.
+f_famName(int f) =>
+    f == F_TREND ? "Trend" : f == F_FLOW ? "Flow" : f == F_BAR ? "Bar"
+     : f == F_VALUE ? "Value" : f == F_GAMMA ? "Gamma"
+     : f == F_LEVEL ? "Level" : "Structure"
+
+// Grouped by family, because that is what the gate counts. A flat list of nine
+// names reads as nine reasons; grouped, the same nine collapse into the three or
+// four separate ideas they actually are, and the arrow shows which way each one
+// nets out.
 f_confList() =>
     string s = ""
-    int shown = 0
     if array.size(cVotes) > 0
-        for i = 0 to array.size(cVotes) - 1
-            v = array.get(cVotes, i)
-            if math.abs(v) > 0.15 and shown < 8
-                s := s + (v > 0 ? "▲ " : "▼ ") + array.get(cNames, i) + "\n"
-                shown += 1
+        for fi = 0 to N_FAM - 1
+            if array.get(famAct, fi)
+                string members = ""
+                for i = 0 to array.size(cVotes) - 1
+                    if array.get(cFam, i) - 1 == fi and math.abs(array.get(cVotes, i)) > 0.15
+                        members := members + (members == "" ? "" : ", ") + array.get(cNames, i)
+                s := s + (array.get(famNum, fi) > 0 ? "▲ " : "▼ ") +
+                     f_famName(fi + 1) + "  ·  " + members + "\n"
     s == "" ? "no confluence active" : str.substring(s, 0, str.length(s) - 1)
 
 if i_hud and barstate.islast
@@ -1353,9 +1380,15 @@ if buySig
     alert("BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
          " | tgt " + str.tostring(longTgt, format.mintick) +
          " | stop " + str.tostring(longStop, format.mintick) +
-         " | R " + str.tostring(longRR, "#.##") + " | " + regime, alert.freq_once_per_bar_close)
+         " | R " + str.tostring(longRR, "#.##") +
+         " | conf " + str.tostring(confidence) + "% " + grade +
+         " (" + str.tostring(nAgree) + "/" + str.tostring(nLive) + " fam)" +
+         " | " + regime, alert.freq_once_per_bar_close)
 if sellSig
     alert("SELL " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
          " | tgt " + str.tostring(shortTgt, format.mintick) +
          " | stop " + str.tostring(shortStop, format.mintick) +
-         " | R " + str.tostring(shortRR, "#.##") + " | " + regime, alert.freq_once_per_bar_close)
+         " | R " + str.tostring(shortRR, "#.##") +
+         " | conf " + str.tostring(confidence) + "% " + grade +
+         " (" + str.tostring(nAgree) + "/" + str.tostring(nLive) + " fam)" +
+         " | " + regime, alert.freq_once_per_bar_close)

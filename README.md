@@ -350,8 +350,10 @@ is the one that decides whether the settings are worth running; total R just
 tells you how busy the day was. It's a live read on the current symbol, not a
 backtest.
 
-**Alerts:** *ITM·GEX Buy*, *ITM·GEX Sell* and *ITM·GEX Exit*. The exit alert
-carries the reason and the R multiple.
+**Alerts:** *ITM·GEX Buy*, *ITM·GEX Sell* and *ITM·GEX Exit*. Entry alerts carry
+the target, stop, R:R, confidence, grade, families agreeing and regime — enough
+to judge the signal without opening the chart. The exit alert carries the reason
+and the R multiple.
 
 ### Pin guard
 
@@ -396,7 +398,10 @@ Opens `http://127.0.0.1:8787`. A background thread re-pulls the chains every
 and scroll position survive each update — the levels track the session instead
 of freezing at whatever the open was. A pulsing **LIVE** badge shows the last
 refresh; it goes grey if a refresh fails, and the last good data stays on
-screen rather than blanking.
+screen rather than blanking. Each symbol keeps its own last good snapshot, so a
+thin chain or a momentary rate limit on one ticker no longer takes the other
+four down with it — the failure is named in the error line and everything else
+carries on refreshing.
 
 This is the closest thing to real-time GEX available here. **TradingView
 itself cannot pull it** — Pine has no way to fetch an options chain, so the
@@ -489,6 +494,10 @@ python3 gex_engine.py --source csv --csv chain.csv \
     --symbols SPY --spot 757.63 --expiry 2026-08-04
 ```
 
+One CSV is one chain, so `--source csv` takes a single symbol. Passing several
+used to emit N identical level sets wearing different tickers, which looks like
+real output.
+
 CSV columns: `type,strike,open_interest,implied_volatility[,gamma][,volume]`.
 Supply a `gamma` column and it's used directly instead of being computed; supply
 `volume` and `--oi-mode` can use it.
@@ -501,9 +510,10 @@ Supply a `gamma` column and it's used directly instead of being computed; supply
 cd tools && python3 test_gex_engine.py
 ```
 
-66 checks covering the gamma math, sign conventions, level derivation, the
+69 checks covering the gamma math, sign conventions, level derivation, the
 gamma flip through a full session clock, contract sizing, blob round-tripping,
-edge cases and dashboard rendering. The gamma implementation is checked against
+edge cases, live-server resilience and dashboard rendering. The gamma
+implementation is checked against
 live broker greeks (SPY 758C, 1DTE) and agrees to **1.5%** — the residual is the
 broker's rate and dividend assumptions.
 
