@@ -317,10 +317,17 @@ def load_yfinance(symbol: str, dte: int) -> tuple[list[Contract], float, date]:
     if not expiries:
         sys.exit(f"No expirations returned for {symbol}")
 
-    today = date.today()
+    # Options expire on the New York calendar, not the calendar of whatever
+    # machine this is running on. `date.today()` west of NY after 21:00 local, or
+    # anywhere east of it in the morning, picks the wrong day — and "wrong day"
+    # for --dte 0 means yesterday's expired chain or tomorrow's.
+    today = datetime.now(timezone.utc).astimezone(NY).date()
     future = [e for e in expiries if date.fromisoformat(e) >= today]
     if not future:
         sys.exit(f"No future expirations for {symbol}")
+    if dte >= len(future):
+        print(f"  {symbol}: only {len(future)} expirations available, "
+              f"--dte {dte} falls back to {future[-1]}", file=sys.stderr)
     expiry_str = future[min(dte, len(future) - 1)]
     expiry = date.fromisoformat(expiry_str)
 
@@ -436,20 +443,29 @@ def run_server(symbols: list[str], dte: int, port: int, interval: int,
     state: dict = {"levels": [], "updated": "", "error": None}
     ready = threading.Event()
 
+    # Last good levels per symbol. One symbol failing — a thin chain, a rate
+    # limit, a momentary 404 — used to discard the whole batch, so a hiccup on
+    # IWM blanked SPY too. Each symbol now keeps its own last good snapshot and
+    # only the ones that actually failed go stale.
+    cache: dict[str, Levels] = {}
+
     def refresh_loop():
         while True:
-            try:
-                out = []
-                for sym in symbols:
+            errors = []
+            for sym in symbols:
+                try:
                     contracts, spot, expiry = load_yfinance(sym, dte)
-                    out.append(derive_levels(sym, expiry, contracts, spot, size_mode))
-                state["levels"] = out
-                state["updated"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-                state["error"] = None
-                print(f"[{state['updated']}] refreshed {', '.join(symbols)}")
-            except Exception as exc:                      # keep serving stale data
-                state["error"] = str(exc)
-                print(f"refresh failed: {exc}", file=sys.stderr)
+                    cache[sym] = derive_levels(sym, expiry, contracts, spot, size_mode)
+                except Exception as exc:                  # keep serving stale data
+                    errors.append(f"{sym}: {exc}")
+            state["levels"] = [cache[s] for s in symbols if s in cache]
+            state["updated"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            state["error"] = "; ".join(errors) if errors else None
+            fresh = [s for s in symbols if s not in {e.split(":")[0] for e in errors}]
+            print(f"[{state['updated']}] refreshed {', '.join(fresh) or '—'}"
+                  + (f"  ({len(errors)} failed: {state['error']})" if errors else ""))
+            if errors:
+                print(f"refresh failed: {state['error']}", file=sys.stderr)
             ready.set()
             time.sleep(interval)
 
@@ -532,6 +548,11 @@ def main() -> None:
         if args.source == "csv":
             if not (args.csv and args.spot and args.expiry):
                 sys.exit("--source csv requires --csv, --spot and --expiry")
+            # One CSV is one chain. Looping it over several symbols produced N
+            # identical level sets wearing different tickers, which looks like
+            # real output and is worse than an error.
+            if len(symbols) > 1:
+                sys.exit("--source csv reads a single chain; pass one --symbols value")
             contracts, spot, expiry = load_csv(args.csv, args.spot,
                                                date.fromisoformat(args.expiry))
         else:
