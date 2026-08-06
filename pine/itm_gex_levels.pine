@@ -944,8 +944,23 @@ lvW     = array.new<float>()
 lvDim   = array.new<int>()
 lvTxt   = array.new<string>()
 
+// Two levels at the same price merge into one line carrying both names, rather
+// than stacking two lines nobody can tell apart. Levels are added majors-first
+// so the heavier styling wins and the second name is appended to its label.
+//
+// This is constant in both modes. With a blob the control node sits on the call
+// wall whenever the heaviest-gamma strike is also the heaviest above spot; in
+// auto mode cwLvl is max(pdh, today's high), which *is* pdh until today takes it
+// out. Either way the same price was being drawn twice.
 f_add(float p, color c, color tc, float w, int d, bool show, string t) =>
-    if show and not na(p)
+    int hit = -1
+    if show and not na(p) and array.size(lvPrice) > 0
+        for i = 0 to array.size(lvPrice) - 1
+            if hit < 0 and math.abs(array.get(lvPrice, i) - p) <= lvlTol
+                hit := i
+    if show and not na(p) and hit >= 0
+        array.set(lvTxt, hit, array.get(lvTxt, hit) + " · " + t)
+    else if show and not na(p)
         array.push(lvPrice, p)
         array.push(lvCol, c)
         array.push(lvTxtC, tc)
@@ -967,9 +982,17 @@ if newDay
 if inRth
     rthClose := close
 
+// In auto mode the majors are max(prior-day high, today's high) and its mirror,
+// so they only *are* the prior day's levels until today trades through them.
+// Labelling them "PDH"/"PDL" unconditionally put the name "PDL" on a heavy line
+// that was actually today's low, on exactly the days price had already broken
+// the real one — the most misleading moment to get it wrong.
+autoHi = not na(pdh) and cwLvl == pdh ? "PDH" : "DAY HI"
+autoLo = not na(pdl) and pwLvl == pdl ? "PDL" : "DAY LO"
+
 // Majors — full opacity, heaviest halo
-f_add(cwLvl,   c_call, color.white, 3.0, 0, i_showWall and not na(cwLvl),  hasGex ? "CALL WALL" : "PDH")
-f_add(pwLvl,   c_put,  color.white, 3.0, 0, i_showWall and not na(pwLvl),  hasGex ? "PUT WALL" : "PDL")
+f_add(cwLvl,   c_call, color.white, 3.0, 0, i_showWall and not na(cwLvl),  hasGex ? "CALL WALL" : autoHi)
+f_add(pwLvl,   c_put,  color.white, 3.0, 0, i_showWall and not na(pwLvl),  hasGex ? "PUT WALL" : autoLo)
 f_add(flipLvl, c_flip, color.black, 2.5, 0, i_showFlip and not na(flipLvl), hasGex ? "FLIP" : "VWAP")
 f_add(cnLvl,   c_node, color.black, 2.5, 0, i_showNode and not na(cnLvl),  hasGex ? "NODE" : "POC")
 
@@ -992,8 +1015,13 @@ f_add(emUp,  c_call, color.white, 0.9, 28, i_showEM and not i_minimal and not na
 f_add(emDn,  c_put,  color.white, 0.9, 28, i_showEM and not i_minimal and not na(emDn), "EM−")
 f_add(sessOpen, C_DIM, color.white, 0.6, 30, i_showOpen and not i_minimal and not na(sessOpen), "OPEN")
 f_add(pdc,      C_DIM, color.white, 0.6, 30, i_showOpen and not i_minimal and not na(pdc), "PDC")
-f_add(pdh, C_DIM, color.white, 0.8, 18, i_showPDHL and not hasGex and not na(pdh), "PDH")
-f_add(pdl, C_DIM, color.white, 0.8, 18, i_showPDHL and not hasGex and not na(pdl), "PDL")
+// Skipped outright rather than merged when they coincide with the majors, since
+// the major already carries the name "PDH"/"PDL" in that case and merging would
+// produce "PDH · PDH".
+f_add(pdh, C_DIM, color.white, 0.8, 18,
+     i_showPDHL and not hasGex and not na(pdh) and pdh != cwLvl, "PDH")
+f_add(pdl, C_DIM, color.white, 0.8, 18,
+     i_showPDHL and not hasGex and not na(pdl) and pdl != pwLvl, "PDL")
 f_add(onh, color.teal, color.white, 0.7, 24, i_showONHL and not i_minimal and not na(onh), "ONH")
 f_add(onl, color.teal, color.white, 0.7, 24, i_showONHL and not i_minimal and not na(onl), "ONL")
 
