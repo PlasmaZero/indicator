@@ -1474,33 +1474,47 @@ f_blocker() =>
     string s = "✓ ready"
     color   c = C_WIN
     if not i_sigOn
-        [s, c] := ["signals off", color.orange]
+        s := "signals off"
+        c := color.orange
     else if not sessionOk
-        [s, c] := ["outside session", color.orange]
+        s := "outside session"
+        c := color.orange
     else if not openOk
-        [s, c] := ["opening range", color.orange]
+        s := "opening range"
+        c := color.orange
     else if not eodOk
-        [s, c] := ["EOD lockout", color.orange]
+        s := "EOD lockout"
+        c := color.orange
     else if not scopeOk
-        [s, c] := ["outside scope", color.orange]
+        s := "outside scope"
+        c := color.orange
     else if buySig or sellSig
-        [s, c] := ["✓ ready", C_WIN]
+        s := "✓ ready"
+        c := C_WIN
     else if (bar_index - lastSig) <= coolBars
-        [s, c] := ["cooldown " + str.tostring(coolBars - (bar_index - lastSig)) + "b", color.orange]
+        s := "cooldown " + str.tostring(coolBars - (bar_index - lastSig)) + "b"
+        c := color.orange
     else if pinned
-        [s, c] := ["pinned to node", color.orange]
+        s := "pinned to node"
+        c := color.orange
     else if confidence < effMinConf
-        [s, c] := ["conf " + str.tostring(confidence) + "% < " + str.tostring(effMinConf) + "%", color.orange]
+        s := "conf " + str.tostring(confidence) + "% < " + str.tostring(effMinConf) + "%"
+        c := color.orange
     else if nAgree < minAgree
-        [s, c] := [str.tostring(nAgree) + "/" + str.tostring(nLive) + " fam", color.orange]
+        s := str.tostring(nAgree) + "/" + str.tostring(nLive) + " fam"
+        c := color.orange
     else if score > 0 and longRR < minRR
-        [s, c] := ["R:R " + str.tostring(longRR, "#.##") + " < " + str.tostring(minRR), color.orange]
+        s := "R:R " + str.tostring(longRR, "#.##") + " < " + str.tostring(minRR)
+        c := color.orange
     else if score < 0 and shortRR < minRR
-        [s, c] := ["R:R " + str.tostring(shortRR, "#.##") + " < " + str.tostring(minRR), color.orange]
+        s := "R:R " + str.tostring(shortRR, "#.##") + " < " + str.tostring(minRR)
+        c := color.orange
     else if score > 0 and blockLong
-        [s, c] := ["γ wall long", color.orange]
+        s := "γ wall long"
+        c := color.orange
     else if score < 0 and blockShort
-        [s, c] := ["γ wall short", color.orange]
+        s := "γ wall short"
+        c := color.orange
     [s, c]
 
 f_famName(int f) =>
