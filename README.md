@@ -459,10 +459,10 @@ Add `pine/itm_gex_levels.pine` to the **futures** chart (`CME:ES1!`, `COMEX:GC1!
 
 A new group **3b · Futures (ES/NQ/GC …)** appears:
 
-* **Instrument** — `Auto` (default) detects futures tickers and switches automatically; force `Futures`/`Equities` to override.
+* **Instrument** — `Auto` (default) detects futures and switches automatically; force `Futures`/`Equities` to override. Detection reads `syminfo.type` (the exchange's own instrument class, `"futures"` for both continuous `ES1!` and dated `ESU2026`) and the contract root from `syminfo.root`, and it also honours a blob carrying `mult`/`mdl:76`. It deliberately does *not* pattern-match the ticker text: `"PL"` is inside AAPL, `"SI"` inside SIRI, `"ES"` inside AES and MESA, `"CL"` inside CLF — substring matching priced those stocks as futures.
 * **Futures session** — `RTH + ETH (23h, break 17:00-18:00)` follows Globex through the night; `RTH only (09:30-16:00)` mirrors the cash session (useful if you trade cash hours on the futures chart); `ETH only` is the overnight ex-RTH.
 * **VWAP anchor** — `ETH open 18:00` anchors Globex VWAP to the 18:00 open (conventional for futures); `RTH open 09:30` keeps the cash-session VWAP even on the futures chart. `ta.vwap` follows the chart's session, so a CME Globex chart is already ETH-anchored — the toggle only matters if you want the other one.
-* **Point value override** — `0 = auto` uses the CME table; set to force a value for a non-standard contract.
+* **Point value override** — `0 = auto`. The order is: this override, then the `mult` the blob was generated with, then the CME table keyed on the exact contract root. Matching the root rather than a substring is what keeps the micros off their big brother's value — MCL is $100/pt not CL's $1000, MGC is $10 not GC's $100.
 
 When futures are detected the HUD shows a **FUT · Black-76 · $50/pt forward** badge, the regime line reads `FUT · POSITIVE γ (Black-76 on forward)`, and the magnet line adds the point value. Expected-move bands are still drawn, but the strip also shows the **notional EM** (`±66 pts · ~$3,322 per ES contract`). Lunch-hour confidence bump is automatically disabled on Globex (no lunch lull).
 
@@ -609,10 +609,19 @@ Supply a `gamma` column and it's used directly instead of being computed; supply
 ## Tests
 
 ```bash
-cd tools && python3 test_gex_engine.py
+cd tools && python3 test_gex_engine.py   # engine + dashboard + live server
+cd tools && python3 lint_pine.py         # static checks on the Pine source
 ```
 
-110+ checks covering the futures Black-76 path (ES/NQ/GC multipliers, forward vs spot, yahoo alias, blob `mult`/`mdl` tags and dashboard FUT badges) plus the gamma math, sign conventions, level derivation, the
+`lint_pine.py` exists because Pine only compiles inside TradingView, so the
+normal way to find a broken script is to paste it in and read the red box —
+a slow loop that stops at the first error. It checks declaration order (Pine
+resolves identifiers strictly top-down, so a block moved for readability can
+start reading a name defined further down and the script simply stops
+compiling), bracket balance, unterminated strings, unindented block bodies,
+and warns about top-level names that are assigned and never read.
+
+150+ checks covering the futures Black-76 path (ES/NQ/GC multipliers, forward vs spot, yahoo alias, blob `mult`/`mdl` tags and dashboard FUT badges) plus the gamma math, sign conventions, level derivation, the
 gamma flip through a full session clock, contract sizing, blob round-tripping,
 edge cases, live-server resilience and dashboard rendering. The gamma
 implementation is checked against

@@ -312,6 +312,38 @@ html_mixed = render_dashboard([lv, lv_es_test])
 check("mixed dashboard has both symbols", "SPY" in html_mixed and "ES" in html_mixed)
 
 
+print("\nSymbol resolution — futures roots vs equity tickers")
+# Substring matching on the ticker is the trap here, and the Pine side was
+# falling into it: "PL" is inside AAPL, "SI" inside SIRI, "ES" inside AES and
+# MESA, "CL" inside CLF, "BTC" inside BTCS. Every one of those is an ordinary
+# stock that must stay on Black-Scholes with a 100-share contract.
+for tkr in ["AAPL", "SIRI", "AES", "MESA", "CLF", "BTCS", "GCI", "PLTR",
+            "NGG", "ZBH", "RBLX", "HOOD", "SPY", "QQQ", "ETHE"]:
+    check(f"{tkr} is not treated as futures",
+          not gex_engine.is_futures(tkr)
+          and gex_engine.multiplier_for(tkr) == 100
+          and gex_engine.model_for(tkr) == "black_scholes")
+
+# The micros must resolve to their own point value, not their big brother's.
+for root, mult in [("ES", 50), ("MES", 5), ("NQ", 20), ("MNQ", 2),
+                   ("GC", 100), ("MGC", 10), ("CL", 1000), ("MCL", 100),
+                   ("YM", 5), ("MYM", 0.5), ("RTY", 50), ("M2K", 5)]:
+    check(f"{root} point value is ${mult:g}", gex_engine.multiplier_for(root) == mult,
+          f"got {gex_engine.multiplier_for(root)}")
+
+# Every spelling of the same contract has to land on one spec.
+for spelling in ["ES", "/ES", "ES=F", "ES1!", "ES2!", "es"]:
+    check(f"'{spelling}' resolves to the ES contract",
+          gex_engine.multiplier_for(spelling) == 50 and gex_engine.is_futures(spelling))
+
+# 2Y notes are $200k face where the rest of the curve is $100k, so a full
+# point is $2000 and not $1000 — the value the whole strip had been given.
+check("ZT is $2000/pt (200k face), not $1000",
+      gex_engine.multiplier_for("ZT") == 2000, f"got {gex_engine.multiplier_for('ZT')}")
+check("ZF/ZN/ZB stay at $1000/pt",
+      all(gex_engine.multiplier_for(s) == 1000 for s in ("ZF", "ZN", "ZB")))
+
+# ---------------------------------------------------------------------------
 print("\nEdge cases")
 empty = derive_levels("XYZ", EXPIRY, [], 100.0)
 check("empty chain yields empty levels, no crash",
