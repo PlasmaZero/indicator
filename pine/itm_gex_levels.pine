@@ -845,10 +845,12 @@ f_levelPool(float tol) =>
     array.sort(arr, order.ascending)
     arr
 
-// The first two levels beyond `px` in the trade's direction, each at least
-// `gap` past the one before it — so TP1 is never a few ticks away and TP2 is
-// never TP1 wearing a different label.
-f_targets(float px, bool up, float gap, float tol) =>
+// The first two levels beyond `px` in the trade's direction. TP1 must be at
+// least `minDist` past px — for a real trade that is risk × minRR, so a target
+// is never accepted unless it clears the stop by the required reward:risk — and
+// TP2 is the next level at least `spacing` past TP1 so it isn't TP1 wearing a
+// different label.
+f_targets(float px, bool up, float minDist, float spacing, float tol) =>
     pool = f_levelPool(tol)
     float t1 = na
     float t2 = na
@@ -856,9 +858,9 @@ f_targets(float px, bool up, float gap, float tol) =>
         if up
             for i = 0 to array.size(pool) - 1
                 v = array.get(pool, i)
-                if na(t1) and v > px + gap
+                if na(t1) and v > px + minDist
                     t1 := v
-                else if not na(t1) and na(t2) and v > t1 + gap
+                else if not na(t1) and na(t2) and v > t1 + spacing
                     t2 := v
         else
             // `for i = size - 1 to 0` is a *descending* loop in Pine, which is
@@ -867,22 +869,11 @@ f_targets(float px, bool up, float gap, float tol) =>
             // The `array.size(pool) > 0` guard above is what keeps that safe.
             for i = array.size(pool) - 1 to 0
                 v = array.get(pool, i)
-                if na(t1) and v < px - gap
+                if na(t1) and v < px - minDist
                     t1 := v
-                else if not na(t1) and na(t2) and v < t1 - gap
+                else if not na(t1) and na(t2) and v < t1 - spacing
                     t2 := v
     [t1, t2]
-
-minGap = atr * 0.35
-// Two levels closer together than this are the same level as far as a target is
-// concerned. Tick-level equality alone would miss a node a cent off a wall.
-lvlTol = math.max(syminfo.mintick, atr * 0.08)
-[longTp1, longTp2]   = f_targets(close, true,  minGap, lvlTol)
-[shortTp1, shortTp2] = f_targets(close, false, minGap, lvlTol)
-
-// No level in range — fall back to a measured move so a trade is still definable.
-longTgt  = na(longTp1)  ? close + atr * 2.0 : longTp1
-shortTgt = na(shortTp1) ? close - atr * 2.0 : shortTp1
 
 // Stop sits beyond structure — past the swing by a buffer rather than exactly
 // on it, since resting liquidity sits at the swing and a stop parked there gets
@@ -892,6 +883,23 @@ rawLongStop  = math.min(ta.lowest(low, 5) - atr * i_stopBuf, close - atr * i_sto
 rawShortStop = math.max(ta.highest(high, 5) + atr * i_stopBuf, close + atr * i_stopATR)
 longStop  = math.max(rawLongStop,  close - atr * i_maxRiskATR)
 shortStop = math.min(rawShortStop, close + atr * i_maxRiskATR)
+
+longRisk  = math.max(close - longStop,  atr * 0.1)
+shortRisk = math.max(shortStop - close, atr * 0.1)
+
+// Two levels closer together than this are the same level as far as a target is
+// concerned. Tick-level equality alone would miss a node a cent off a wall.
+lvlTol = math.max(syminfo.mintick, atr * 0.08)
+// TP1 must clear the stop by the required reward:risk (risk × minRR, not a fixed
+// ATR fraction — that was the bug that made R:R come out ~0.34). TP2 keeps the
+// ATR spacing so the runner isn't shoved out past anything a session can reach.
+[longTp1, longTp2]   = f_targets(close, true,  longRisk * minRR,  atr, lvlTol)
+[shortTp1, shortTp2] = f_targets(close, false, shortRisk * minRR, atr, lvlTol)
+
+// No level far enough — fall back to a measured move that still clears the stop,
+// so a definable trade exists and the R:R gate stays satisfiable.
+longTgt  = na(longTp1)  ? close + longRisk  * minRR : longTp1
+shortTgt = na(shortTp1) ? close - shortRisk * minRR : shortTp1
 
 longRR  = (close - longStop)  > 0 ? (longTgt - close)  / (close - longStop)  : 0.0
 shortRR = (shortStop - close) > 0 ? (close - shortTgt) / (shortStop - close) : 0.0
@@ -1457,6 +1465,44 @@ if nextOpen and i_manageOn and tDir == 0 and (buySig or sellSig)
 // =============================================================================
 //  HUD — one compact card: what the confluences say, and where price can go
 // =============================================================================
+// Which gate is currently holding a trade up? Shown first in the HUD so a dead
+// chart names its own cause — quiet tape and unsatisfiable arithmetic no longer
+// look identical. Order matters: a signal firing right now is "ready", not "in
+// cooldown" (lastSig is set to bar_index on the bar that fires, so checking the
+// cooldown before the firing state would report a fresh signal as blocked).
+f_blocker() =>
+    string s = "✓ ready"
+    color   c = C_WIN
+    if not i_sigOn
+        [s, c] := ["signals off", color.orange]
+    else if not sessionOk
+        [s, c] := ["outside session", color.orange]
+    else if not openOk
+        [s, c] := ["opening range", color.orange]
+    else if not eodOk
+        [s, c] := ["EOD lockout", color.orange]
+    else if not scopeOk
+        [s, c] := ["outside scope", color.orange]
+    else if buySig or sellSig
+        [s, c] := ["✓ ready", C_WIN]
+    else if (bar_index - lastSig) <= coolBars
+        [s, c] := ["cooldown " + str.tostring(coolBars - (bar_index - lastSig)) + "b", color.orange]
+    else if pinned
+        [s, c] := ["pinned to node", color.orange]
+    else if confidence < effMinConf
+        [s, c] := ["conf " + str.tostring(confidence) + "% < " + str.tostring(effMinConf) + "%", color.orange]
+    else if nAgree < minAgree
+        [s, c] := [str.tostring(nAgree) + "/" + str.tostring(nLive) + " fam", color.orange]
+    else if score > 0 and longRR < minRR
+        [s, c] := ["R:R " + str.tostring(longRR, "#.##") + " < " + str.tostring(minRR), color.orange]
+    else if score < 0 and shortRR < minRR
+        [s, c] := ["R:R " + str.tostring(shortRR, "#.##") + " < " + str.tostring(minRR), color.orange]
+    else if score > 0 and blockLong
+        [s, c] := ["γ wall long", color.orange]
+    else if score < 0 and blockShort
+        [s, c] := ["γ wall short", color.orange]
+    [s, c]
+
 f_famName(int f) =>
     f == F_TREND ? "Trend" : f == F_FLOW ? "Flow" : f == F_BAR ? "Bar"
      : f == F_VALUE ? "Value" : f == F_GAMMA ? "Gamma"
@@ -1484,7 +1530,7 @@ if i_hud and barstate.islast
     dirTxt  = waiting ? "◆  WAIT" : score > 0 ? "▲  LONG BIAS" : "▼  SHORT BIAS"
     dirCol  = waiting ? color.gray : score > 0 ? C_WIN : C_LOSS
 
-    var table t = table.new(position.top_right, 1, 7, border_width = 0,
+    var table t = table.new(position.top_right, 1, 8, border_width = 0,
          frame_color = color.new(color.gray, 60), frame_width = 1)
 
     // headline: direction + confidence
@@ -1533,7 +1579,16 @@ if i_hud and barstate.islast
          text_color = hasGex ? c_node : color.gray, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 
-    table.cell(t, 0, 6, i_hudDetail ? f_confList() : "",
+    // the blocker — names the gate holding a trade up, with live R:R both ways
+    // so "⧗ R:R 0.34 < 1.30" tells you which dial to turn instead of a bare WAIT.
+    [blkTxt, blkCol] = f_blocker()
+    table.cell(t, 0, 6,
+         (blkTxt == "✓ ready" ? "✓ ready" : "⧗ " + blkTxt) +
+         "   R:R  ↑" + str.tostring(longRR, "#.##") + "  ↓" + str.tostring(shortRR, "#.##"),
+         text_color = blkCol, bgcolor = color.new(color.black, 85),
+         text_size = size.tiny, text_halign = text.align_left)
+
+    table.cell(t, 0, 7, i_hudDetail ? f_confList() : "",
          text_color = color.silver, bgcolor = color.new(color.black, i_hudDetail ? 85 : 100),
          text_size = size.tiny, text_halign = text.align_left)
 // Session scorecard — today's closed trades only, reset each day.
