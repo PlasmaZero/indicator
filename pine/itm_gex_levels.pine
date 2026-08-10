@@ -245,8 +245,18 @@ var float gexEM   = f_key(i_blob, "em")
 // full-day starting point, which is far too tight and turns confluence 12 into
 // a spurious fade generator at both edges.
 var float gexRef  = f_key(i_blob, "ref")
+// Futures blobs carry the contract the engine actually priced: `mult` is the
+// dollar point value and `mdl:76` marks Black-76 on the forward. Equity blobs
+// omit both. These were emitted by gex_engine.py but never read here, so the
+// chart fell back to guessing the contract from the ticker even when the blob
+// had already stated it.
+var float gexMult = f_key(i_blob, "mult")
+var float gexMdl  = f_key(i_blob, "mdl")
 
 var bool hasGex = not na(gexFlip) or not na(gexCW) or not na(gexPW)
+// A blob that stamped a multiplier or Black-76 came from a futures chain,
+// whatever the chart's own symbol says.
+blobIsFutures = hasGex and (not na(gexMult) or (not na(gexMdl) and gexMdl == 76))
 
 // Per-strike profile: "strike=gex" pairs
 var float[] pStrike = array.new<float>()
@@ -264,6 +274,99 @@ if barstate.isfirst and str.length(i_prof) > 0
                 array.push(pStrike, k)
                 array.push(pGex, v)
                 pMaxAbs := math.max(pMaxAbs, math.abs(v))
+
+// =============================================================================
+//  Instrument & session
+// =============================================================================
+// This block has to come before the auto levels: the VWAP anchor, the session
+// bar counts and the overnight range all read `isFutures` / `inRthCoreOnly`,
+// and Pine resolves identifiers strictly top-down — a forward reference is a
+// compile error ("Undeclared identifier"), not a late binding.
+
+// ── Futures vs equities — instrument detection & session ────────────────
+// The instrument type comes from the exchange, not from a substring of the
+// ticker. `str.contains(ticker, "PL")` is true for AAPL, "SI" for SIRI, "ES"
+// for AES/GES/MESA, "CL" for CLF, "GC" for GCI, "BTC" for BTCS — every one of
+// those equities was silently priced as a future: Black-76 labels, a $100/pt
+// notional and a 23h Globex session on a stock that trades 09:30-16:00.
+// syminfo.type is "futures" for both continuous (ES1!) and dated (ESU2026)
+// contracts, so it is the whole test.
+isFuturesTicker = syminfo.type == "futures"
+
+// The contract root: "ES" for ES1!, "MNQ" for MNQU2026. Matching on the root
+// is exact, so MES no longer has to be tested before ES to avoid a collision.
+futRoot = str.upper(syminfo.root != "" ? syminfo.root : syminfo.ticker)
+isFutures = i_asset == "Futures" or (i_asset == "Auto" and (isFuturesTicker or blobIsFutures))
+isFuturesForcedEq = i_asset == "Equities"
+
+// Point value: the blob wins, then the manual override, then the root table.
+// Matching is on the exact contract root rather than a substring of the ticker,
+// which is what let MCL fall through to CL's $1000 (it is $100), MGC to GC's
+// $100 (it is $10) and M2K to a $100 default. `switch` also removes the
+// ordering trap the old chain had, where the micros had to be tested first.
+f_rootPointValue(string root) =>
+    switch root
+        "ES"  => 50.0
+        "MES" => 5.0
+        "NQ"  => 20.0
+        "MNQ" => 2.0
+        "YM"  => 5.0
+        "MYM" => 0.5
+        "RTY" => 50.0
+        "M2K" => 5.0
+        "GC"  => 100.0
+        "MGC" => 10.0
+        "SI"  => 5000.0
+        "SIL" => 1000.0
+        "HG"  => 25000.0
+        "PL"  => 50.0
+        "PA"  => 100.0
+        "CL"  => 1000.0
+        "MCL" => 100.0
+        "NG"  => 10000.0
+        "HO"  => 42000.0
+        "RB"  => 42000.0
+        "ZB"  => 1000.0
+        "ZN"  => 1000.0
+        "ZF"  => 1000.0
+        // ZT is $200k face where the rest are $100k, so a point is $2000
+        "ZT"  => 2000.0
+        "6E"  => 125000.0
+        "6B"  => 62500.0
+        "6J"  => 12500000.0
+        "BTC" => 5.0
+        "MBT" => 0.1
+        "ETH" => 50.0
+        "MET" => 0.1
+        "VIX" => 1000.0
+        => float(na)
+
+// The generator already knows the contract it priced and stamps `mult:` onto a
+// futures blob. Reading it keeps the chart and the engine on one number even
+// for a root the table below has never heard of; the table is the fallback for
+// when no blob is loaded.
+f_pointValue() =>
+    tbl = f_rootPointValue(futRoot)
+    i_pointOverride > 0 ? i_pointOverride
+     : not na(gexMult) and gexMult > 0 ? gexMult
+     : not na(tbl) ? tbl
+     : isFutures ? 1.0 : 100.0
+
+pointValue = f_pointValue()
+underlyingLabel = isFutures ? "forward" : "spot"
+
+// CME Globex break 17:00-18:00 ET — the only hour futures are closed
+inEthBreak = not na(time(timeframe.period, "1700-1800", "America/New_York"))
+inRthCore  = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+inEthOnly  = not inEthBreak and not inRthCore
+inFutAll   = not inEthBreak
+inFutRth   = inRthCore
+// User choice
+inFutSession = i_futSession == "RTH only (09:30-16:00)" ? inFutRth : i_futSession == "ETH only (18:00-17:00 ex-RTH)" ? inEthOnly : inFutAll
+inRth = isFutures and not isFuturesForcedEq ? inFutSession : inRthCore
+// For clarity: RTH-core vs the tradable session
+inSession = inRth
+inRthCoreOnly = inRthCore
 
 // =============================================================================
 //  Auto levels
@@ -295,8 +398,13 @@ if rthOpenBar
     rthVol := volume
 rthVwap = rthVol > 0 ? rthPV / rthVol : na
 useRthVwap = isFutures and not isFuturesForcedEq and i_futVwapAnchor == "RTH open 09:30"
+// Both deviations are computed on every bar. A `ta.*` call reached only through
+// one branch of a ternary still has to see every bar to keep its rolling window
+// intact — evaluating it conditionally silently corrupts the window it is
+// averaging over. Selecting between two fully-evaluated series is the safe form.
+rthVwapSd = ta.stdev(close - rthVwap, 40)
 vwap   = useRthVwap ? rthVwap : vwapRaw
-vwapSd = useRthVwap ? ta.stdev(close - rthVwap, 40) : vwapSdRaw
+vwapSd = useRthVwap ? rthVwapSd : vwapSdRaw
 
 // Prior day / overnight
 var float pdh = na
@@ -311,80 +419,6 @@ if newDay
 else
     dHi := math.max(nz(dHi, high), high)
     dLo := math.min(nz(dLo, low), low)
-
-// ── Futures vs equities — instrument detection & session ────────────────
-f_isFuturesTicker() =>
-    t = syminfo.ticker
-    // Check micros before their big brothers so MES does not match ES first
-    str.contains(t, "MES") or str.contains(t, "MNQ") or str.contains(t, "MGC") or str.contains(t, "MCL") or str.contains(t, "MYM") or str.contains(t, "M2K")
-     or str.contains(t, "RTY") or str.contains(t, "GC") or str.contains(t, "SI") or str.contains(t, "HG") or str.contains(t, "PL")
-     or str.contains(t, "CL") or str.contains(t, "NG") or str.contains(t, "HO") or str.contains(t, "RB")
-     or str.contains(t, "ZB") or str.contains(t, "ZN") or str.contains(t, "ZT") or str.contains(t, "BTC") or str.contains(t, "ETH")
-     or syminfo.ticker == "ES" or syminfo.ticker == "NQ" or syminfo.ticker == "YM" or syminfo.ticker == "GC" or syminfo.ticker == "SI" or syminfo.ticker == "CL"
-     or str.contains(t, "ES") or str.contains(t, "NQ") or str.contains(t, "YM")
-
-isFuturesTicker = f_isFuturesTicker()
-isFutures = i_asset == "Futures" or (i_asset == "Auto" and isFuturesTicker)
-isFuturesForcedEq = i_asset == "Equities"
-
-// Point value: auto table, override wins. Used for notional EM and display.
-f_pointValue() =>
-    if i_pointOverride > 0
-        i_pointOverride
-    else if str.contains(syminfo.ticker, "MES")
-        5.0
-    else if str.contains(syminfo.ticker, "MNQ")
-        2.0
-    else if str.contains(syminfo.ticker, "MGC")
-        10.0
-    else if str.contains(syminfo.ticker, "MCL")
-        100.0
-    else if str.contains(syminfo.ticker, "MYM")
-        0.5
-    else if str.contains(syminfo.ticker, "M2K")
-        5.0
-    else if str.contains(syminfo.ticker, "ES")
-        50.0
-    else if str.contains(syminfo.ticker, "NQ")
-        20.0
-    else if str.contains(syminfo.ticker, "RTY")
-        50.0
-    else if str.contains(syminfo.ticker, "YM")
-        5.0
-    else if str.contains(syminfo.ticker, "GC")
-        100.0
-    else if str.contains(syminfo.ticker, "SI")
-        5000.0
-    else if str.contains(syminfo.ticker, "HG")
-        25000.0
-    else if str.contains(syminfo.ticker, "CL")
-        1000.0
-    else if str.contains(syminfo.ticker, "NG")
-        10000.0
-    else if str.contains(syminfo.ticker, "ZB") or str.contains(syminfo.ticker, "ZN") or str.contains(syminfo.ticker, "ZT")
-        1000.0
-    else if str.contains(syminfo.ticker, "BTC")
-        5.0
-    else if str.contains(syminfo.ticker, "ETH")
-        50.0
-    else
-        100.0
-
-pointValue = f_pointValue()
-underlyingLabel = isFutures ? "forward" : "spot"
-
-// CME Globex break 17:00-18:00 ET — the only hour futures are closed
-inEthBreak = not na(time(timeframe.period, "1700-1800", "America/New_York"))
-inRthCore  = not na(time(timeframe.period, "0930-1600", "America/New_York"))
-inEthOnly  = not inEthBreak and not inRthCore
-inFutAll   = not inEthBreak
-inFutRth   = inRthCore
-// User choice
-inFutSession = i_futSession == "RTH only (09:30-16:00)" ? inFutRth : i_futSession == "ETH only (18:00-17:00 ex-RTH)" ? inEthOnly : inFutAll
-inRth = isFutures and not isFuturesForcedEq ? inFutSession : inRthCore
-// For clarity: RTH-core vs the tradable session
-inSession = inRth
-inRthCoreOnly = inRthCore
 
 // Overnight runs from one session's close to the next one's open. Resetting on
 // the calendar day boundary threw away the post-close hours and kept only the
@@ -827,6 +861,10 @@ f_targets(float px, bool up, float gap, float tol) =>
                 else if not na(t1) and na(t2) and v > t1 + gap
                     t2 := v
         else
+            // `for i = size - 1 to 0` is a *descending* loop in Pine, which is
+            // what is wanted here — but on an empty pool the bounds become
+            // `-1 to 0`, which counts *up* and reads index 0 of an empty array.
+            // The `array.size(pool) > 0` guard above is what keeps that safe.
             for i = array.size(pool) - 1 to 0
                 v = array.get(pool, i)
                 if na(t1) and v < px - gap
@@ -868,7 +906,7 @@ lateSession = (isFutures and not isFuturesForcedEq ? inRthCoreOnly : inRth) and 
 // For Globex the 60% mark is ~08:00 next day; the pin risk is really RTH 13:30-16:00, so for futures we also gate on RTH late
 lateSessionIsRthLate = inRthCoreOnly and rthCoreBar > math.round(390.0 / tfMin) * 0.6
 pinnedBase = isFutures and not isFuturesForcedEq ? lateSessionIsRthLate : lateSession
-pinned = i_pinGuard and posGamma and hasGex and (isFutures and not isFuturesForcedEq ? lateSessionIsRthLate : lateSession)
+pinned = i_pinGuard and posGamma and hasGex and pinnedBase
      and not na(cnLvl) and atr > 0 and math.abs(close - cnLvl) < atr * 0.35
 
 var int lastSig = -1000
@@ -1483,15 +1521,15 @@ if i_hud and barstate.islast
          "magnet " + (na(magnet) ? "—" : str.tostring(magnet, format.mintick)) +
          "  " + (magnetPull > 0.05 ? "↑" : magnetPull < -0.05 ? "↓" : "•") +
          "     rvol " + str.tostring(rvol, "#.#") + "×" +
-         (isFutures ? "  ·  $" + str.tostring(pointValue, format.mintick) + "/pt" : ""),
+         (isFutures ? "  ·  $" + str.tostring(pointValue, "#.##") + "/pt" : ""),
          text_color = c_node, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 
     // data source — states outright whether real GEX is loaded + futures model
     table.cell(t, 0, 5,
          (hasGex ? "● GEX levels loaded" : "○ auto levels — no GEX blob") +
-         (hasGex and isFutures ? "  ·  FUT Black-76  $" + str.tostring(pointValue, format.mintick) + "/pt forward" : "") +
-         (hasGex and not isFutures ? "  ·  EQ Black-Scholes spot" : ""),
+         (hasGex and isFutures ? "  ·  FUT Black-76  $" + str.tostring(pointValue, "#.##") + "/pt " + underlyingLabel : "") +
+         (hasGex and not isFutures ? "  ·  EQ Black-Scholes " + underlyingLabel : ""),
          text_color = hasGex ? c_node : color.gray, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 

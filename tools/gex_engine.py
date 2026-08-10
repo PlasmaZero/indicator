@@ -90,7 +90,9 @@ FUTURES_SPECS: dict[str, dict] = {
     # Rates
     "ZB":  {"multiplier": 1000, "tick": 0.03125, "yf": "ZB=F", "name": "30Y T-Bond",             "exchange": "CBOT",  "model": "black76"},
     "ZN":  {"multiplier": 1000, "tick": 0.015625,"yf": "ZN=F", "name": "10Y T-Note",            "exchange": "CBOT",  "model": "black76"},
-    "ZT":  {"multiplier": 1000, "tick": 0.0078125,"yf":"ZT=F", "name": "2Y T-Note",             "exchange": "CBOT",  "model": "black76"},
+    "ZF":  {"multiplier": 1000, "tick": 0.0078125,"yf":"ZF=F", "name": "5Y T-Note",             "exchange": "CBOT",  "model": "black76"},
+    # ZT is the odd one out: $200k face, not $100k, so a full point is $2000.
+    "ZT":  {"multiplier": 2000, "tick": 0.0078125,"yf":"ZT=F", "name": "2Y T-Note",             "exchange": "CBOT",  "model": "black76"},
     # FX (quoted differently but still Black-76 on the forward)
     "6E":  {"multiplier": 125000,"tick": 0.00005, "yf": "6E=F","name": "Euro FX",               "exchange": "CME",   "model": "black76"},
     "6B":  {"multiplier": 62500, "tick": 0.0001,  "yf": "6B=F","name": "British Pound",         "exchange": "CME",   "model": "black76"},
