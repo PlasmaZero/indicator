@@ -1,7 +1,8 @@
 # GEX Levels + 0DTE Signal Engine
 
 Dealer gamma-exposure levels on the chart, plus a 5-minute buy/sell engine tuned
-for 0DTE and 1DTE trading on SPY, QQQ, IWM, TSLA and NVDA.
+for 0DTE and 1DTE trading on SPY, QQQ, IWM, TSLA and NVDA — and on the index and
+metals futures that track them (ES, NQ, RTY, GC).
 
 Three pieces:
 
@@ -501,6 +502,86 @@ real output.
 CSV columns: `type,strike,open_interest,implied_volatility[,gamma][,volume]`.
 Supply a `gamma` column and it's used directly instead of being computed; supply
 `volume` and `--oi-mode` can use it.
+
+---
+
+## Futures
+
+Two things need setting, and one of them is automatic.
+
+### Session
+
+Everything time-of-day — the open and close skips, the pin guard's "late
+session" test, the end-of-day flatten, the midday confidence bump — is measured
+against the session length. That was hardcoded to the 390-minute NYSE day, which
+is right for exactly one instrument class.
+
+*Trading session* defaults to **Auto**, which reads `syminfo`:
+
+| Instrument | Session (New York) | Minutes |
+|---|---|---|
+| Equities and ETFs | 0930-1600 | 390 |
+| Index futures — ES, NQ, RTY, YM | 0930-1615 | 405 |
+| COMEX metals — GC, SI, HG, PL, PA | 0820-1330 | 310 |
+| Anything else | 0930-1600 | 390 |
+
+Presets and a free-form *Custom session* field cover the rest — `1800-1700` for
+a full overnight-plus-day view, or whatever your contract actually keeps. The
+length is parsed from the string, so a custom session is measured correctly too.
+
+The midday bump moved with it: it is now the middle 30–70% of the session rather
+than a wall-clock window. On 0930-1600 that lands on 11:27–14:03, which is the
+window it replaces, and on GC it lands in the middle of the metals session
+instead of after it has closed.
+
+### Levels
+
+There is no futures options chain the engine can read, so real GEX has to come
+from the tracking ETF and be mapped across. SPY levels are SPX/10 and ES is SPX
+plus basis, so the transform is **scale, then offset**:
+
+| Chart | Chain from | Scale |
+|---|---|---|
+| ES | SPY | 10 |
+| NQ | QQQ | ~41 |
+| RTY | IWM | ~10 |
+| GC | GLD | ~10.9 |
+
+Those ratios drift — GLD sheds a little to its expense ratio every year — so
+don't trust the table. Read both prices off TradingView and divide.
+
+The workflow:
+
+1. Generate a blob for the ETF as normal: `--symbols SPY --dte 0`.
+2. Paste it into the futures chart and set **Level scale**.
+3. Read the **fit** figure the HUD prints next to "GEX levels loaded" and paste
+   it into **Level offset**.
+
+The fit is the offset that lines the blob's own reference spot up with current
+price. It is the basis, and the basis is not stable: it decays toward zero into
+expiry and moves with rates. Re-read it when you re-paste.
+
+One caveat worth understanding. The offset is fitted at current price, so the
+mapping is exact there and drifts as you move away from it — a 1% scale error
+puts a level 50 points from spot half a point out. The levels that matter are
+near spot, which is where the fit is good, but a wall two big figures away is
+approximate.
+
+Without a blob, futures need nothing beyond the session preset. Auto mode is
+derived entirely from price, volume and VWAP, all of which futures have — with
+real exchange volume rather than the fragmented equity tape, so the cumulative
+delta and volume-profile reads are arguably better than on the ETFs.
+
+### Two settings to reconsider
+
+**Market context** reads SPY against its own VWAP as a breadth proxy. That is
+reasonable for ES and NQ and meaningless for GC. Point it at something
+correlated or set its weight to 0 — feeding the vote noise is worse than letting
+the confluence drop out, which the engine handles cleanly.
+
+**Flatten at session close** exists because 0DTE contracts decay to nothing
+overnight. Futures carry fine. Turn it off if you actually intend to hold
+through the gap, and expect the R multiples to widen in both directions.
 
 ---
 

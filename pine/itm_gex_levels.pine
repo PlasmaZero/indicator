@@ -35,6 +35,22 @@ i_blob = input.text_area("", "GEX blob",
      tooltip = "Paste from gex_engine.py, e.g.\n" +
                "flip:757.2,cw:762,pw:750,cn:758,cw2:765,pw2:745,net:1.24,em:4.8",
      group = G_LVL)
+// Futures have no options chain the engine can read, so the way to get real GEX
+// onto an ES/NQ/GC chart is to generate it from the tracking ETF and map the
+// levels across. SPY levels are SPX/10 and ES is SPX plus basis, so the
+// transform is a multiply then an add — scale first, offset second.
+//
+//   ES  ← SPY   scale 10      NQ  ← QQQ   scale ~41
+//   GC  ← GLD   scale ~10.9   RTY ← IWM   scale ~10
+//
+// The offset is the basis, and it is not stable — it decays toward zero into
+// expiry and moves with rates. The HUD prints the offset that would line the
+// blob's own reference spot up with current price; paste that in.
+i_lvlScale  = input.float(1.0, "Level scale", minval = 0.0001, step = 0.1, group = G_LVL,
+     inline = "map",
+     tooltip = "Multiplies every price in the blob. 1 for the symbol the chain came from; 10 for SPY→ES, ~41 for QQQ→NQ, ~10.9 for GLD→GC.")
+i_lvlOffset = input.float(0.0, "offset", step = 0.25, group = G_LVL, inline = "map",
+     tooltip = "Added after scaling — the futures basis. Read the suggested value off the HUD.")
 i_showFlip = input.bool(true,  "Gamma flip (HVL)",  group = G_LVL, inline = "a")
 i_showWall = input.bool(true,  "Call / put walls",  group = G_LVL, inline = "a")
 i_showNode = input.bool(true,  "Control node",      group = G_LVL, inline = "b")
@@ -57,6 +73,15 @@ i_showVWAP = input.bool(true, "VWAP + 1σ bands",    group = G_AUTO)
 // ── Signal engine ────────────────────────────────────────────────────────────
 i_sigOn    = input.bool(true, "Enable signals", group = G_SIG)
 i_rthOnly  = input.bool(true, "Regular hours only", group = G_SIG)
+// The session drives more than a filter: it sets how long a session is, which
+// the end-of-day skip, the pin guard's "late session" test and the time-based
+// gates are all measured against. 390 minutes is the NYSE day and nothing else —
+// index futures run 405, COMEX metals 310.
+i_sessMode = input.string("Auto", "Trading session", group = G_SIG,
+     options = ["Auto", "Equities · 0930-1600", "Index futures · 0930-1615",
+                "Metals · 0820-1330", "Overnight + day · 1800-1700", "Custom"],
+     tooltip = "Auto reads syminfo: 0930-1615 ET for futures, 0820-1330 for COMEX metals, 0930-1600 otherwise. All times are New York.")
+i_sessCustom = input.session("0930-1600", "Custom session (New York time)", group = G_SIG)
 i_skipOpen = input.int(2,  "Skip first N bars",  minval = 0, maxval = 12, group = G_SIG)
 i_skipEOD  = input.int(2,  "Skip last N bars",   minval = 0, maxval = 12, group = G_SIG)
 i_preset   = input.string("Balanced", "Signal frequency",
@@ -96,7 +121,8 @@ w_ctx    = input.float(8,  "Market context (SPY)",   minval = 0, maxval = 30, gr
 w_div    = input.float(10, "Delta divergence",       minval = 0, maxval = 30, group = G_CONF, inline = "h")
 
 i_htf    = input.timeframe("15", "Higher timeframe", group = G_CONF)
-i_ctxSym = input.symbol("AMEX:SPY", "Context symbol", group = G_CONF)
+i_ctxSym = input.symbol("AMEX:SPY", "Context symbol", group = G_CONF,
+     tooltip = "A breadth proxy, read as above/below its own VWAP. It has to be correlated with what you are trading: fine for ES, NQ and equities, meaningless for GC. Set the Market context weight to 0 rather than feeding the vote noise.")
 
 i_emaFast = input.int(9,  "EMA fast", minval = 2, group = G_SIG, inline = "m")
 i_emaSlow = input.int(21, "EMA slow", minval = 3, group = G_SIG, inline = "m")
@@ -128,7 +154,8 @@ i_maxMin   = input.int(120, "Time stop (minutes, 0 = off)", minval = 0, maxval =
      group = G_RISK,
      tooltip = "Closes a trade that has not reached TP1 in this long. One position runs at a time, so a trade going nowhere is also blocking every better setup behind it.")
 i_beAtTp1  = input.bool(true, "Move stop to breakeven at TP1", group = G_RISK)
-i_exitEOD  = input.bool(true, "Flatten at session close (0DTE)", group = G_RISK)
+i_exitEOD  = input.bool(true, "Flatten at session close", group = G_RISK,
+     tooltip = "0DTE contracts decay to nothing overnight, so holding one past the close is not a position. Futures do carry overnight — turn this off if you actually want to hold through the gap, and expect the R multiples to widen in both directions.")
 i_exitFlip = input.bool(false, "Exit if score flips against the trade", group = G_RISK)
 i_onOpposite = input.string("Exit", "On opposite signal", options = ["Exit", "Ignore"],
      group = G_RISK,
@@ -203,24 +230,29 @@ f_key(string blob, string key) =>
                 out := str.tonumber(array.get(kv, 1))
     out
 
-var float gexFlip = f_key(i_blob, "flip")
-var float gexCW   = f_key(i_blob, "cw")
-var float gexPW   = f_key(i_blob, "pw")
-var float gexCN   = f_key(i_blob, "cn")
-var float gexCW2  = f_key(i_blob, "cw2")
-var float gexPW2  = f_key(i_blob, "pw2")
-var float gexCW3  = f_key(i_blob, "cw3")
-var float gexPW3  = f_key(i_blob, "pw3")
-var float gexCWO  = f_key(i_blob, "cwo")
-var float gexPWO  = f_key(i_blob, "pwo")
-var float gexNet  = f_key(i_blob, "net")
-var float gexEM   = f_key(i_blob, "em")
+// Prices map through scale-then-offset; distances (the expected move) scale but
+// take no offset, since an offset would shift a width.
+f_mapPx(float v) => na(v) ? na : v * i_lvlScale + i_lvlOffset
+
+var float gexFlip = f_mapPx(f_key(i_blob, "flip"))
+var float gexCW   = f_mapPx(f_key(i_blob, "cw"))
+var float gexPW   = f_mapPx(f_key(i_blob, "pw"))
+var float gexCN   = f_mapPx(f_key(i_blob, "cn"))
+var float gexCW2  = f_mapPx(f_key(i_blob, "cw2"))
+var float gexPW2  = f_mapPx(f_key(i_blob, "pw2"))
+var float gexCW3  = f_mapPx(f_key(i_blob, "cw3"))
+var float gexPW3  = f_mapPx(f_key(i_blob, "pw3"))
+var float gexCWO  = f_mapPx(f_key(i_blob, "cwo"))
+var float gexPWO  = f_mapPx(f_key(i_blob, "pwo"))
+var float gexNet  = f_key(i_blob, "net")            // dollar gamma, not a price
+var float gexEM   = f_key(i_blob, "em") * i_lvlScale
 // Spot when the blob was generated. The expected move is the move *remaining*
 // from that price to the close, so the band hangs off it; anchoring to the
 // session open makes a midday regeneration draw a half-day band around a
 // full-day starting point, which is far too tight and turns confluence 12 into
 // a spurious fade generator at both edges.
-var float gexRef  = f_key(i_blob, "ref")
+var float gexRefRaw = f_key(i_blob, "ref")          // unmapped, to suggest the offset
+var float gexRef    = f_mapPx(gexRefRaw)
 
 var bool hasGex = not na(gexFlip) or not na(gexCW) or not na(gexPW)
 
@@ -237,7 +269,7 @@ if barstate.isfirst and str.length(i_prof) > 0
             k = str.tonumber(array.get(kv, 0))
             v = str.tonumber(array.get(kv, 1))
             if not na(k) and not na(v)
-                array.push(pStrike, k)
+                array.push(pStrike, f_mapPx(k))     // strikes are prices, map them too
                 array.push(pGex, v)
                 pMaxAbs := math.max(pMaxAbs, math.abs(v))
 
@@ -263,7 +295,44 @@ else
     dHi := math.max(nz(dHi, high), high)
     dLo := math.min(nz(dLo, low), low)
 
-inRth = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+// ── Session ──────────────────────────────────────────────────────────────────
+sessAuto = syminfo.type == "futures"
+     ? (syminfo.root == "GC" or syminfo.root == "SI" or syminfo.root == "HG"
+        or syminfo.root == "PL" or syminfo.root == "PA" ? "0820-1330" : "0930-1615")
+     : "0930-1600"
+sessStr = i_sessMode == "Auto" ? sessAuto
+     : i_sessMode == "Equities · 0930-1600" ? "0930-1600"
+     : i_sessMode == "Index futures · 0930-1615" ? "0930-1615"
+     : i_sessMode == "Metals · 0820-1330" ? "0820-1330"
+     : i_sessMode == "Overnight + day · 1800-1700" ? "1800-1700"
+     : i_sessCustom
+
+// Length of the session in minutes, parsed from the session string rather than
+// assumed. A day-of-week mask ("0930-1600:23456") is trimmed first, and a
+// session that ends before it starts has crossed midnight.
+f_sessMinutes(string s) =>
+    parts = str.split(s, ":")
+    t = array.size(parts) > 0 ? array.get(parts, 0) : s
+    float out = 390.0
+    if str.length(t) >= 9
+        h1 = str.tonumber(str.substring(t, 0, 2))
+        m1 = str.tonumber(str.substring(t, 2, 4))
+        h2 = str.tonumber(str.substring(t, 5, 7))
+        m2 = str.tonumber(str.substring(t, 7, 9))
+        if not na(h1) and not na(m1) and not na(h2) and not na(m2)
+            d = (h2 * 60 + m2) - (h1 * 60 + m1)
+            out := d <= 0 ? d + 1440 : d
+    out
+
+inRth = not na(time(timeframe.period, sessStr, "America/New_York"))
+
+// The session boundary, which is not the calendar day boundary. On a futures
+// chart `timeframe.change("D")` fires at the 18:00 open, and on an equities
+// chart with extended hours it fires at 04:00 — neither is when the session
+// being traded actually begins. The `or newDay` arm covers charts with extended
+// hours switched off, where every bar is in-session and the transition never
+// fires on its own.
+newSession = inRth and (not inRth[1] or newDay)
 
 // Overnight runs from one session's close to the next one's open. Resetting on
 // the calendar day boundary threw away the post-close hours and kept only the
@@ -285,7 +354,7 @@ var map<int, float> vp = map.new<int, float>()
 var float bkt    = na
 var float pocVol = 0.0
 var float pocPx  = na
-if newDay or na(bkt)
+if newSession or na(bkt)
     map.clear(vp)
     pocVol := 0.0
     pocPx  := na
@@ -313,7 +382,7 @@ cnLvl   = hasGex ? gexCN   : (i_autoOn ? poc : na)
 // Expected-move envelope around the session open — also a target candidate,
 // so it has to exist before the trade logic below.
 var float sessOpen = na
-if newDay
+if newSession
     sessOpen := open
 emAnchor = not na(gexRef) ? gexRef : sessOpen
 emUp = na(gexEM) or na(emAnchor) ? na : emAnchor + gexEM
@@ -355,9 +424,9 @@ regime = not hasGex
 
 // Session bar count — the opening range and the session filters both need it.
 var int rthBar = 0
-rthBar := inRth ? rthBar + 1 : 0
+rthBar := newSession ? 1 : inRth ? rthBar + 1 : 0
 tfMin    = math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
-rthTotal = math.round(390.0 / tfMin)
+rthTotal = math.max(1, math.round(f_sessMinutes(sessStr) / tfMin))
 // Time stop expressed in minutes so it means the same thing on any timeframe.
 maxTradeBars = i_maxMin > 0 ? math.max(1, int(math.round(i_maxMin / tfMin))) : 0
 
@@ -371,7 +440,7 @@ rsi  = ta.rsi(close, 14)
 rng      = math.max(high - low, syminfo.mintick)
 barDelta = (2 * (close - low) / rng - 1) * volume
 var float cvd = 0.0
-cvd := newDay ? barDelta : cvd + barDelta
+cvd := newSession ? barDelta : cvd + barDelta
 cvdSlope = cvd - cvd[i_cvdLen]
 cvdNorm  = ta.stdev(cvdSlope, 50)
 rvol     = volume / math.max(ta.sma(volume, i_rvolLen), 1)
@@ -386,7 +455,7 @@ disp    = atr > 0 ? (close - open) / atr : 0.0
 orbBars = math.max(1, int(math.round(i_orbMin / tfMin)))
 var float orbHi = na
 var float orbLo = na
-if newDay
+if newSession
     orbHi := na
     orbLo := na
 if inRth and rthBar <= orbBars
@@ -632,7 +701,11 @@ scopeOk     = not (i_todayOnly and hasGex) or curSession
 // Midday. Ranges compress, levels stop being defended with any conviction, and a
 // reading that would resolve at 10:00 chops out instead. Raising the bar is
 // cheaper than a hard block: a genuinely strong setup still gets through.
-lunch      = not na(time(timeframe.period, "1130-1400", "America/New_York"))
+//
+// Measured as the middle of the session rather than a wall-clock window, so it
+// travels to instruments that don't keep NYSE hours. On 0930-1600 it works out
+// at 11:27-14:03, which is the window it replaces.
+lunch      = inRth and rthBar > rthTotal * 0.3 and rthBar < rthTotal * 0.7
 effMinConf = minConf + (lunch ? i_lunchBump : 0)
 // The score a reversal has to reach to close a trade on FLIP. It tracks the
 // effective gate, so midday noise can't knock a position out on a reading that
@@ -776,7 +849,7 @@ var int   nWin = 0
 var int   nLoss = 0
 var float sumR = 0.0
 var int   nSkip = 0          // pending entries a gap made untradable
-if newDay
+if newSession
     nWin := 0
     nLoss := 0
     sumR := 0.0
@@ -977,7 +1050,7 @@ C_DIM = #8a8f98
 // both chart types.
 var float rthClose = na
 var float pdc = na
-if newDay
+if newSession
     pdc := rthClose
 if inRth
     rthClose := close
@@ -1357,8 +1430,17 @@ if i_hud and barstate.islast
          text_color = c_node, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 
-    // data source — states outright whether real GEX is loaded
-    table.cell(t, 0, 5, hasGex ? "● GEX levels loaded" : "○ auto levels — no GEX blob",
+    // Data source, and — when the levels are being mapped from another symbol's
+    // chain — the offset that would line the blob's own reference spot up with
+    // current price. The basis moves, so this is the number to re-paste rather
+    // than a one-time setup value.
+    fitOffset = na(gexRefRaw) ? na : close - gexRefRaw * i_lvlScale
+    mapTxt = i_lvlScale == 1.0 and i_lvlOffset == 0.0 ? ""
+         : "  ×" + str.tostring(i_lvlScale, "#.####") +
+           (i_lvlOffset >= 0 ? " +" : " ") + str.tostring(i_lvlOffset, "#.##") +
+           (na(fitOffset) ? "" : "  (fit " + str.tostring(fitOffset, "+#.##;-#.##") + ")")
+    table.cell(t, 0, 5,
+         (hasGex ? "● GEX levels loaded" : "○ auto levels — no GEX blob") + mapTxt,
          text_color = hasGex ? c_node : color.gray, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 
