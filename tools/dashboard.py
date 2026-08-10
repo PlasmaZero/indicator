@@ -3,6 +3,9 @@ Self-contained HTML dashboard for the GEX engine.
 
 render_dashboard(levels) returns a single HTML string with no external
 requests — data is embedded as JSON and the chart is drawn with inline SVG.
+
+Adds futures-aware tiles: contract point value, pricing model (Black-76 vs
+Black-Scholes) and the correct underlying label (spot vs forward).
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ CSS = """
   --neg: #e34948;
   --neutral: #f0efec;
   --accent: #eda100;
+  --futures-bg: #1a2332;
+  --futures-fg: #7eb8ff;
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) .viz-root {
@@ -45,6 +50,8 @@ CSS = """
     --neg: #e66767;
     --neutral: #383835;
     --accent: #c98500;
+    --futures-bg: #0f2138;
+    --futures-fg: #7eb8ff;
   }
 }
 :root[data-theme="dark"] .viz-root {
@@ -61,6 +68,8 @@ CSS = """
   --neg: #e66767;
   --neutral: #383835;
   --accent: #c98500;
+  --futures-bg: #0f2138;
+  --futures-fg: #7eb8ff;
 }
 body { margin: 0; background: var(--plane); }
 .viz-root {
@@ -73,6 +82,12 @@ body { margin: 0; background: var(--plane); }
 .wrap { max-width: 1080px; margin: 0 auto; }
 h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 2px; letter-spacing: -0.01em; }
 .sub { color: var(--text-secondary); font-size: 0.8125rem; margin: 0 0 20px; }
+.badge-fut { display: inline-flex; align-items: center; gap: 4px; background: var(--futures-bg); color: var(--futures-fg);
+  font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid rgba(126,184,255,0.25); vertical-align: middle; }
+.badge-eq { display: inline-flex; align-items: center; gap: 4px; background: var(--neutral); color: var(--muted);
+  font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); vertical-align: middle; }
 .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
 .tab {
   font: inherit; font-size: 0.8125rem; font-weight: 500;
@@ -81,6 +96,7 @@ h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 2px; letter-spacing: -0.0
   border: 1px solid var(--border);
 }
 .tab[aria-selected="true"] { background: var(--text-primary); color: var(--surface-1); border-color: transparent; }
+.tab.fut-tab[aria-selected="true"] { background: var(--futures-bg); color: #fff; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 10px; }
 .tile.pos { box-shadow: inset 3px 0 0 var(--pos); }
 .tile.neg { box-shadow: inset 3px 0 0 var(--neg); }
@@ -126,6 +142,9 @@ body.stale .live i { background: var(--muted); animation: none; }
 #tip { position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
   background: var(--text-primary); color: var(--surface-1); font-size: 0.75rem;
   padding: 7px 10px; border-radius: 7px; z-index: 20; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.specs { font-size: 0.75rem; color: var(--text-secondary); background: var(--plane);
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+.specs b { color: var(--text-primary); }
 """
 
 JS = r"""
@@ -198,7 +217,7 @@ function chart(d) {
   });
   s += `<text class="tick" x="${cx}" y="${H-padB+18}" text-anchor="middle">0</text>`;
 
-  // level rules
+  // level rules — label depends on futures vs equity
   const strikes = rows.map(r => r[0]);
   const lo = Math.min(...strikes), hi = Math.max(...strikes);
   const yForPrice = p => {
@@ -207,10 +226,11 @@ function chart(d) {
     const t = (hi - p) / (hi - lo);
     return padT + t * (rows.length * rowH);
   };
+  const spotLabel = d.is_futures ? 'FUT' : 'SPOT';
   // Spot and the gamma flip often sit within a point of each other, so lay the
   // rules at their true y but push the labels apart to keep both readable.
   const marks = [
-    [d.spot, 'var(--text-primary)', 'SPOT'],
+    [d.spot, 'var(--text-primary)', spotLabel],
     [d.gamma_flip, 'var(--accent)', 'FLIP'],
   ].filter(m => m[0] != null)
    .map(m => ({ v: m[0], col: m[1], lab: m[2], y: yForPrice(m[0]) }))
@@ -301,35 +321,61 @@ function render(sym) {
 
   const n2 = v => v == null ? '—' : v.toFixed(2);
   const n0 = v => v == null ? '—' : v.toFixed(0);
+  const isFut = !!d.is_futures;
+  const mult = d.multiplier || d.point_value || (isFut ? 50 : 100);
+  const model = d.model || (isFut ? 'black76' : 'black_scholes');
+  const spotName = d.underlying_label || (isFut ? 'forward' : 'spot');
+  const futBadge = isFut ? `<span class="badge-fut">FUT · ${model==='black76'?'Black-76':'BS'} · $${mult}/pt</span>`
+                         : `<span class="badge-eq">EQ · BS · $100</span>`;
 
-  // Four headline tiles; everything else drops to a compact strip so the top of
-  // the page answers "what regime, and where is it pulling" at a glance.
+  // Headline tiles — spot vs forward labelled correctly
+  const spotTitle = isFut ? 'Futures' : 'Spot';
+  const spotSub = isFut ? `forward · ${d.expiry} · Globex` : `exp ${d.expiry}`;
   $('#tiles').innerHTML = `
-    <div class="tile"><div class="k">Spot</div><div class="v">${n2(d.spot)}</div>
-      <div class="n">exp ${d.expiry}</div></div>
+    <div class="tile"><div class="k">${spotTitle} ${futBadge}</div><div class="v">${n2(d.spot)}</div>
+      <div class="n">${spotSub}</div></div>
     <div class="tile ${d.gamma_flip == null ? '' : posG ? 'pos' : 'neg'}"><div class="k">Regime</div>
       <div class="v">${regime} γ</div><div class="n">${regimeNote}</div></div>
     <div class="tile"><div class="k">Gamma flip</div><div class="v">${n2(d.gamma_flip)}</div>
-      <div class="n">regime divider</div></div>
+      <div class="n">regime divider · ${spotName}</div></div>
     <div class="tile"><div class="k">Control node</div><div class="v">${n2(d.control_node)}</div>
       <div class="n">the magnet</div></div>`;
 
-  $('#strip').innerHTML = [
+  // Compact strip — add futures-aware fields when present
+  const stripItems = [
     ['Net GEX', money(d.net_gex) + ' /1%'],
-    ['Expected move', d.expected_move == null ? '—' : '±' + d.expected_move.toFixed(2)],
+    ['Expected move', d.expected_move == null ? '—' : '±' + d.expected_move.toFixed(2) + (isFut ? ` pts · ~$${Math.round(Math.abs(d.expected_move*mult)).toLocaleString()}` : '')],
     ['ATM IV', d.atm_iv == null ? '—' : (d.atm_iv * 100).toFixed(1) + '%'],
     ['GEX walls', n0(d.put_wall) + ' / ' + n0(d.call_wall)],
     ['OI walls', n0(d.put_wall_oi) + ' / ' + n0(d.call_wall_oi)],
     ['Sized by', d.size_mode === 'oi' ? 'open interest'
       : d.size_mode === 'volume' ? 'session volume'
       : d.size_mode === 'max' ? 'max(OI, volume)' : 'OI + volume'],
-  ].map(([k, v]) => `<span><b>${k}</b>${v}</span>`).join('');
+  ];
+  if (isFut) {
+    stripItems.push(['Point value', `$${mult}/pt`]);
+    stripItems.push(['Model', model==='black76' ? 'Black-76 on forward' : 'Black-Scholes']);
+  }
+  $('#strip').innerHTML = stripItems.map(([k, v]) => `<span><b>${k}</b>${v}</span>`).join('');
 
   $('#chart').innerHTML = chart(d);
   $('#table').innerHTML = table(d);
   $('#blobs').innerHTML =
       `<div class="blob"><span class="k">GEX blob → Pine "GEX blob"</span>${d.pine_blob}</div>`
     + `<div class="blob"><span class="k">Strike profile → Pine "Strike profile"</span>${d.pine_profile}</div>`;
+
+  // Futures footnote
+  const foot = $('#specFoot');
+  if (foot) {
+    if (isFut) {
+      foot.innerHTML = `<b>${d.symbol}</b> futures GEX: options on futures, priced Black-76 on the live forward <b>${d.spot.toFixed(2)}</b>,`
+        + ` $/1% move scaled by $${mult}/pt (not $100). Levels are futures-price levels — plot them on the <b>${d.symbol}</b> futures chart, not the cash index.`
+        + ` <span style="opacity:0.7">Model ${model} · ${spotName}</span>`;
+      foot.style.display = 'block';
+    } else {
+      foot.style.display = 'none';
+    }
+  }
 
   $('#chart').querySelectorAll('path[data-k]').forEach(p => {
     p.addEventListener('mousemove', e => {
@@ -387,6 +433,7 @@ PAGE = """<!doctype html>
   <div class="tabs" role="tablist">%(tabs)s</div>
   <div class="tiles" id="tiles"></div>
   <div class="strip" id="strip"></div>
+  <div class="specs" id="specFoot" style="display:none"></div>
 
   <div class="card">
     <h2>GEX by strike</h2>
@@ -403,7 +450,7 @@ PAGE = """<!doctype html>
 
   <div class="card">
     <h2>Pine inputs</h2>
-    <p class="hint">Paste into the matching fields of the TradingView indicator.</p>
+    <p class="hint">Paste into the matching fields of the TradingView indicator. For futures (ES/NQ/GC), paste onto the <b>futures</b> chart (e.g. CME:ES1!) — levels are futures-price levels.</p>
     <div id="blobs"></div>
   </div>
 
@@ -435,7 +482,7 @@ def payload_for(levels_list) -> list[dict]:
 def render_dashboard(levels_list, live: bool = False, poll_ms: int = 30000) -> str:
     payload = payload_for(levels_list)
     tabs = "".join(
-        f'<button class="tab" role="tab" data-sym="{d["symbol"]}" '
+        f'<button class="tab{" fut-tab" if d.get("is_futures") else ""}" role="tab" data-sym="{d["symbol"]}" '
         f'aria-selected="false">{d["symbol"]}</button>'
         for d in payload
     )

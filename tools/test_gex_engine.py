@@ -196,6 +196,122 @@ check("flip round-trips through the blob",
 check("call wall round-trips", parsed["cw"] == lv.call_wall)
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+print("\nFutures — Black-76, multipliers, ES/NQ/GC adaptation")
+# Verify the futures spec table: the three numbers that matter for GEX correctness
+from gex_engine import (
+    FUTURES_SPECS, black76_gamma, futures_spec, is_futures, multiplier_for, model_for,
+    yf_symbol_for,
+)
+
+check("ES is recognised as a future", is_futures("ES"))
+check("NQ is recognised as a future", is_futures("NQ"))
+check("GC is recognised as a future", is_futures("GC"))
+check("SPY is not a future", not is_futures("SPY"))
+check("/ES alias resolves", futures_spec("/ES") is not None)
+check("ES=F yahoo alias resolves", futures_spec("ES=F") is not None)
+check("ES multiplier is $50/pt", multiplier_for("ES") == 50)
+check("NQ multiplier is $20/pt", multiplier_for("NQ") == 20)
+check("GC multiplier is $100/pt", multiplier_for("GC") == 100)
+check("SI multiplier is $5000/pt", multiplier_for("SI") == 5000)
+check("CL multiplier is $1000/pt", multiplier_for("CL") == 1000)
+check("MGC multiplier is $10/pt", multiplier_for("MGC") == 10)
+check("MES multiplier is $5/pt", multiplier_for("MES") == 5)
+check("override multiplier wins", multiplier_for("ES", override=100) == 100)
+check("ES yahoo symbol is ES=F", yf_symbol_for("ES") == "ES=F")
+check("GC yahoo symbol is GC=F", yf_symbol_for("GC") == "GC=F")
+check("SPY yahoo pass-through", yf_symbol_for("SPY") == "SPY")
+check("ES model is black76", model_for("ES") == "black76")
+check("GC model is black76", model_for("GC") == "black76")
+check("SPY model is black_scholes", model_for("SPY") == "black_scholes")
+check("explicit model override", model_for("ES", override="black_scholes") == "black_scholes")
+
+# Black-76 vs Black-Scholes identity at r=0: should be numerically identical
+check("Black-76 at r=0 equals Black-Scholes at r=0",
+      abs(black76_gamma(100, 100, 0.02, 0.2, r=0.0) - bs_gamma(100, 100, 0.02, 0.2, r=0.0)) < 1e-12)
+# With discount the Black-76 gamma is slightly lower (exp(-rT) factor) — at 0DTE negligible, at 30DTE visible
+g76_r0 = black76_gamma(100, 100, 0.08, 0.2, r=0.0)
+g76_disc = black76_gamma(100, 100, 0.08, 0.2, r=0.045)
+check("Black-76 discount lowers gamma for longer T", g76_disc < g76_r0 and abs(g76_disc/g76_r0 - math.exp(-0.045*0.08)) < 1e-12)
+
+# strike_gex scaling: same gamma, different multiplier → proportional notional
+c_test = Contract("call", 100, 1000, 0.2)
+gex_100 = strike_gex(c_test, 100, 0.02, multiplier=100, model="black_scholes")
+gex_50  = strike_gex(c_test, 100, 0.02, multiplier=50,  model="black_scholes")
+check("GEX scales with multiplier (100 vs 50)", abs(gex_50*2 - gex_100) < 1e-6)
+# futures GEX uses forward not spot — same inputs should give same gamma at r=0
+gex_fut = strike_gex(c_test, 100, 0.02, multiplier=50, model="black76", r=0.0)
+check("Black-76 r=0 matches BS at same multiplier", abs(gex_fut - gex_50) < 1e-6)
+
+# Level derivation for futures — the same hedging logic, different price scale
+# ES ~ 6000, NQ ~ 21000, GC ~ 2700 — test each headliner the prompt asks for
+for sym, spot, strikes, ivs in [
+    ("ES", 6000, {5950:5000, 6000:10000, 6050:8000, 6100:4000}, {5950:0.15, 6000:0.15, 6050:0.15, 6100:0.15}),
+    ("NQ", 21000, {20800:3000, 21000:8000, 21200:6000}, {20800:0.18, 21000:0.18, 21200:0.18}),
+    ("GC", 2700, {2650:2000, 2700:5000, 2750:3000}, {2650:0.14, 2700:0.14, 2750:0.14}),
+]:
+    conts = []
+    for k, oi in strikes.items():
+        # mix calls above / puts below so we get walls on both sides
+        kind = "call" if k >= spot else "put"
+        conts.append(Contract(kind, float(k), oi, ivs[k]))
+        # add opposite side too for richer chain
+        opp = "put" if kind=="call" else "call"
+        conts.append(Contract(opp, float(k), oi//2, ivs[k]))
+    lvf = derive_levels(sym, date(2026,8,5), conts, float(spot), now=NOW)
+    check(f"{sym} flagged as futures", lvf.is_futures, f"got {lvf.is_futures}")
+    check(f"{sym} model is black76", lvf.model == "black76", f"got {lvf.model}")
+    check(f"{sym} point value matches spec", lvf.multiplier == FUTURES_SPECS[sym]["multiplier"])
+    check(f"{sym} underlying label is forward", lvf.underlying_label == "forward")
+    check(f"{sym} call wall above forward", lvf.call_wall is not None and lvf.call_wall >= spot)
+    check(f"{sym} put wall below forward", lvf.put_wall is not None and lvf.put_wall <= spot)
+    check(f"{sym} expected move sane", lvf.expected_move is not None and 0 < lvf.expected_move < spot*0.05)
+    # notional EM in dollars should be reasonable per contract
+    if lvf.expected_move and lvf.multiplier:
+        notional = abs(lvf.expected_move * lvf.multiplier)
+        check(f"{sym} notional EM ~ ${{notional:.0f}} sane", 200 < notional < 50000,
+              f"notional ${notional:.0f} for move {lvf.expected_move:.1f} pts * ${lvf.multiplier}/pt")
+
+# Explicit override: force ES to be treated as equity (for SPX-proxy use-case)
+lv_es_eq = derive_levels("ES", date(2026,8,5),
+                         [Contract("call", 6000, 1000, 0.15), Contract("put", 5950, 1000, 0.15)],
+                         6000, now=NOW, model="black_scholes", multiplier=100)
+check("forced equity model on futures symbol", lv_es_eq.model=="black_scholes" and not lv_es_eq.is_futures)
+check("forced multiplier override", lv_es_eq.multiplier==100)
+
+# Futures total_gex and flip respect multiplier/model
+Tfut = year_fraction(date(2026,8,5), now=NOW)
+conts_f = [Contract("call", 6000, 5000, 0.15), Contract("put", 5900, 5000, 0.15)]
+gf = find_gamma_flip(conts_f, 5950, Tfut, multiplier=50, model="black76", r=0.045)
+check("futures gamma flip found", gf is not None)
+# At r=0 the flip should be nearly identical between models (discount is tiny at 0DTE)
+gf_r0_76 = find_gamma_flip(conts_f, 5950, Tfut, multiplier=50, model="black76", r=0.0)
+gf_bs    = find_gamma_flip(conts_f, 5950, Tfut, multiplier=50, model="black_scholes", r=0.0)
+check("futures vs BS flip close at r=0", gf_r0_76 is not None and gf_bs is not None and abs(gf_r0_76 - gf_bs) < 2.0)
+
+# Pine blob for futures carries mult and mdl keys (backward-compatible — old Pine ignores them)
+lv_es_test = derive_levels("ES", date(2026,8,5),
+                           [Contract("call", 6050, 5000, 0.15), Contract("put", 5950, 5000, 0.15)],
+                           6000, now=NOW)
+blob_f = pine_blob(lv_es_test)
+check("futures blob carries mult", "mult:" in blob_f, blob_f)
+check("futures blob carries mdl", "mdl:" in blob_f, blob_f)
+check("equity blob does not carry mult", "mult:" not in pine_blob(lv), pine_blob(lv))
+
+# Dashboard payload and rendering for futures
+from dashboard import render_dashboard, payload_for
+pl_f = payload_for([lv_es_test])
+check("futures payload carries multiplier", pl_f[0]["multiplier"] == 50)
+check("futures payload is_futures true", pl_f[0]["is_futures"] is True)
+html_f = render_dashboard([lv_es_test])
+check("futures dashboard shows FUT badge", "FUT" in html_f and "badge-fut" in html_f and "forward" in html_f)
+check("futures dashboard no external requests", "http://" not in html_f)
+# Mixed dashboard (equity + futures) tabs both present
+html_mixed = render_dashboard([lv, lv_es_test])
+check("mixed dashboard has both symbols", "SPY" in html_mixed and "ES" in html_mixed)
+
+
 print("\nEdge cases")
 empty = derive_levels("XYZ", EXPIRY, [], 100.0)
 check("empty chain yields empty levels, no crash",

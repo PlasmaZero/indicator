@@ -19,13 +19,22 @@
 //  run it with --serve for a live dashboard that refreshes through the session.
 //  With no blob the indicator falls back to auto levels derived from price,
 //  volume profile and VWAP so it still works on any symbol.
+//
+//  Futures mode (ES/NQ/GC/CL …): set Instrument to Auto or Futures — the
+//  indicator auto-detects the ticker, switches the session (23h Globex vs RTH),
+//  labels levels as forward levels (Black-76 on the futures price, with the
+//  correct CME point value: ES $50/pt, NQ $20, GC $100, SI $5000, CL $1000 …)
+//  and shows FUT badges in the HUD. Generate the futures blob with
+//  `gex_engine.py --symbols ES,NQ,GC --dte 0` (or --source csv with a CME
+//  QuikStrike export) and paste it onto the *futures* chart (e.g. CME:ES1!).
 // =============================================================================
-indicator("ITM GEX Levels + 0DTE Signal Engine", "ITM·GEX", overlay = true,
+indicator("ITM GEX Levels + 0DTE Signal Engine — Equities & Futures", "ITM·GEX", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
 G_LVL  = "1 · GEX levels"
 G_PROF = "2 · GEX profile"
 G_AUTO = "3 · Auto levels (fallback)"
+G_FUT  = "3b · Futures (ES/NQ/GC …)"
 G_SIG  = "4 · Signal engine"
 G_RISK = "5 · Targets & risk"
 G_UI   = "6 · Display"
@@ -53,6 +62,21 @@ i_autoOn   = input.bool(true, "Use auto levels when blob is empty", group = G_AU
 i_showPDHL = input.bool(true, "Prior day high/low", group = G_AUTO)
 i_showONHL = input.bool(true, "Overnight high/low", group = G_AUTO)
 i_showVWAP = input.bool(true, "VWAP + 1σ bands",    group = G_AUTO)
+
+// ── Futures mode ─────────────────────────────────────────────────────────────
+i_asset = input.string("Auto", "Instrument",
+     options = ["Auto", "Equities", "Futures"], group = G_FUT,
+     tooltip = "Auto detects ES/NQ/GC/SI/CL/NG/RTY/YM/ZB/ZN/BTC/MGC/MES/MNQ as futures and switches pricing (Black-76 vs Black-Scholes), point-value and session handling. Force Futures/Equities to override the ticker guess.")
+i_futSession = input.string("RTH + ETH (23h, break 17:00-18:00)", "Futures session",
+     options = ["RTH + ETH (23h, break 17:00-18:00)", "RTH only (09:30-16:00)", "ETH only (18:00-17:00 ex-RTH)"],
+     group = G_FUT,
+     tooltip = "CME Globex is ~23h with a 1h break 17:00-18:00 ET. RTH+ETH follows the futures price through the night; RTH only mirrors the cash session (useful if you trade cash hours on the futures chart); ETH only is the overnightGlobex ex-RTH.")
+i_futVwapAnchor = input.string("ETH open 18:00", "VWAP anchor (futures)",
+     options = ["ETH open 18:00", "RTH open 09:30", "Chart session"], group = G_FUT,
+     tooltip = "Futures VWAP is conventionally anchored to the Globex open (18:00 ET), not the equity RTH open. RTH anchor keeps the cash-session VWAP even on the futures chart.")
+i_pointOverride = input.float(0, "Point value override ($/pt, 0 = auto)", minval = 0, step = 1, group = G_FUT,
+     tooltip = "Dollar per 1.00 point. Auto: ES $50, NQ $20, GC $100, SI $5000, CL $1000, NG $10000, RTY $50, YM $5, ZB/ZN $1000, BTC $5, MGC $10, MES $5, MNQ $2. Set to 0 to use the auto table from the symbol.")
+
 
 // ── Signal engine ────────────────────────────────────────────────────────────
 i_sigOn    = input.bool(true, "Enable signals", group = G_SIG)
@@ -246,8 +270,33 @@ if barstate.isfirst and str.length(i_prof) > 0
 // =============================================================================
 newDay = timeframe.change("D")
 atr    = ta.atr(14)
-vwap   = ta.vwap(hlc3)
-vwapSd = ta.stdev(close - vwap, 40)
+// VWAP anchoring — equities always RTH; futures can be Globex (ETH) or RTH.
+// ta.vwap follows the chart's session, so a CME:ES1! chart on Globex session is ETH-anchored.
+// For an explicit RTH anchor on a futures chart we accumulate manually on RTH only.
+vwapRaw   = ta.vwap(hlc3)
+vwapSdRaw = ta.stdev(close - vwapRaw, 40)
+var float rthPV = na
+var float rthVol = na
+if inRthCoreOnly
+    rthPV  := nz(rthPV) + hlc3 * volume
+    rthVol := nz(rthVol) + volume
+else if not inRthCoreOnly and inRthCoreOnly[1]
+    // just closed RTH — keep values frozen for the overnight, reset at next RTH open
+    rthPV  := rthPV
+    rthVol := rthVol
+else if newDay  // midnight reset safety
+    // will reset at next RTH open anyway
+    rthPV  := rthPV
+    rthVol := rthVol
+// At the RTH open (first bar of RTH) reset
+rthOpenBar = inRthCoreOnly and not inRthCoreOnly[1]
+if rthOpenBar
+    rthPV  := hlc3 * volume
+    rthVol := volume
+rthVwap = rthVol > 0 ? rthPV / rthVol : na
+useRthVwap = isFutures and not isFuturesForcedEq and i_futVwapAnchor == "RTH open 09:30"
+vwap   = useRthVwap ? rthVwap : vwapRaw
+vwapSd = useRthVwap ? ta.stdev(close - rthVwap, 40) : vwapSdRaw
 
 // Prior day / overnight
 var float pdh = na
@@ -263,20 +312,92 @@ else
     dHi := math.max(nz(dHi, high), high)
     dLo := math.min(nz(dLo, low), low)
 
-inRth = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+// ── Futures vs equities — instrument detection & session ────────────────
+f_isFuturesTicker() =>
+    t = syminfo.ticker
+    // Check micros before their big brothers so MES does not match ES first
+    str.contains(t, "MES") or str.contains(t, "MNQ") or str.contains(t, "MGC") or str.contains(t, "MCL") or str.contains(t, "MYM") or str.contains(t, "M2K")
+     or str.contains(t, "RTY") or str.contains(t, "GC") or str.contains(t, "SI") or str.contains(t, "HG") or str.contains(t, "PL")
+     or str.contains(t, "CL") or str.contains(t, "NG") or str.contains(t, "HO") or str.contains(t, "RB")
+     or str.contains(t, "ZB") or str.contains(t, "ZN") or str.contains(t, "ZT") or str.contains(t, "BTC") or str.contains(t, "ETH")
+     or syminfo.ticker == "ES" or syminfo.ticker == "NQ" or syminfo.ticker == "YM" or syminfo.ticker == "GC" or syminfo.ticker == "SI" or syminfo.ticker == "CL"
+     or str.contains(t, "ES") or str.contains(t, "NQ") or str.contains(t, "YM")
+
+isFuturesTicker = f_isFuturesTicker()
+isFutures = i_asset == "Futures" or (i_asset == "Auto" and isFuturesTicker)
+isFuturesForcedEq = i_asset == "Equities"
+
+// Point value: auto table, override wins. Used for notional EM and display.
+f_pointValue() =>
+    if i_pointOverride > 0
+        i_pointOverride
+    else if str.contains(syminfo.ticker, "MES")
+        5.0
+    else if str.contains(syminfo.ticker, "MNQ")
+        2.0
+    else if str.contains(syminfo.ticker, "MGC")
+        10.0
+    else if str.contains(syminfo.ticker, "MCL")
+        100.0
+    else if str.contains(syminfo.ticker, "MYM")
+        0.5
+    else if str.contains(syminfo.ticker, "M2K")
+        5.0
+    else if str.contains(syminfo.ticker, "ES")
+        50.0
+    else if str.contains(syminfo.ticker, "NQ")
+        20.0
+    else if str.contains(syminfo.ticker, "RTY")
+        50.0
+    else if str.contains(syminfo.ticker, "YM")
+        5.0
+    else if str.contains(syminfo.ticker, "GC")
+        100.0
+    else if str.contains(syminfo.ticker, "SI")
+        5000.0
+    else if str.contains(syminfo.ticker, "HG")
+        25000.0
+    else if str.contains(syminfo.ticker, "CL")
+        1000.0
+    else if str.contains(syminfo.ticker, "NG")
+        10000.0
+    else if str.contains(syminfo.ticker, "ZB") or str.contains(syminfo.ticker, "ZN") or str.contains(syminfo.ticker, "ZT")
+        1000.0
+    else if str.contains(syminfo.ticker, "BTC")
+        5.0
+    else if str.contains(syminfo.ticker, "ETH")
+        50.0
+    else
+        100.0
+
+pointValue = f_pointValue()
+underlyingLabel = isFutures ? "forward" : "spot"
+
+// CME Globex break 17:00-18:00 ET — the only hour futures are closed
+inEthBreak = not na(time(timeframe.period, "1700-1800", "America/New_York"))
+inRthCore  = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+inEthOnly  = not inEthBreak and not inRthCore
+inFutAll   = not inEthBreak
+inFutRth   = inRthCore
+// User choice
+inFutSession = i_futSession == "RTH only (09:30-16:00)" ? inFutRth : i_futSession == "ETH only (18:00-17:00 ex-RTH)" ? inEthOnly : inFutAll
+inRth = isFutures and not isFuturesForcedEq ? inFutSession : inRthCore
+// For clarity: RTH-core vs the tradable session
+inSession = inRth
+inRthCoreOnly = inRthCore
 
 // Overnight runs from one session's close to the next one's open. Resetting on
 // the calendar day boundary threw away the post-close hours and kept only the
 // pre-market, so "ONH" was never the overnight high — it was the 04:00-09:30
 // high. Resetting when RTH ends captures the whole gap, and the levels then sit
 // frozen through the session, which is what they are for.
-rthEnded = not inRth and inRth[1]
+rthEnded = not inRthCoreOnly and inRthCoreOnly[1]  // always RTH 16:00-09:30 gap, even on futures
 var float onh = na
 var float onl = na
 if rthEnded
     onh := high
     onl := low
-else if not inRth
+else if not inRthCoreOnly
     onh := na(onh) ? high : math.max(onh, high)
     onl := na(onl) ? low  : math.min(onl, low)
 
@@ -334,14 +455,15 @@ posGamma = not na(flipLvl) and close > flipLvl
 negGamma = not na(flipLvl) and close < flipLvl
 // Without a blob the "flip" is only VWAP, so the bias is a mean-reversion proxy
 // and must not be reported as a gamma regime — there is no options data behind it.
-regime = not hasGex
+regimeBase = not hasGex
      ? (na(flipLvl) ? "NO DATA · price-only"
         : posGamma ? "AUTO · above VWAP (no GEX)" : "AUTO · below VWAP (no GEX)")
      : posGamma ? "POSITIVE γ · mean-revert / pin"
      : negGamma ? "NEGATIVE γ · trend / expand"
-     // Walls loaded but no flip: the engine found no sign change in the chain
-     // and declined to invent one, so there is no regime to report.
      : "GEX loaded · no flip in the chain"
+futTag = isFutures ? "FUT · " : ""
+modelTag = isFutures ? (not hasGex ? "" : " (Black-76 on forward)") : ""
+regime = futTag + regimeBase + modelTag
 
 // =============================================================================
 //  Signal components  (each returns roughly -1 … +1)
@@ -355,9 +477,13 @@ regime = not hasGex
 
 // Session bar count — the opening range and the session filters both need it.
 var int rthBar = 0
-rthBar := inRth ? rthBar + 1 : 0
+rthBar := inSession ? rthBar + 1 : 0  // counts chosen session (Globex or RTH)
+var int rthCoreBar = 0
+rthCoreBar := inRthCoreOnly ? rthCoreBar + 1 : 0
 tfMin    = math.max(1.0, timeframe.in_seconds(timeframe.period) / 60.0)
-rthTotal = math.round(390.0 / tfMin)
+// Session length: RTH is 390 min; Globex is 1380 min (23h); overnight ex-RTH is 990 min
+sessLenMin = isFutures and not isFuturesForcedEq ? (i_futSession == "RTH only (09:30-16:00)" ? 390.0 : i_futSession == "ETH only (18:00-17:00 ex-RTH)" ? 990.0 : 1380.0) : 390.0
+rthTotal = math.round(sessLenMin / tfMin)
 // Time stop expressed in minutes so it means the same thing on any timeframe.
 maxTradeBars = i_maxMin > 0 ? math.max(1, int(math.round(i_maxMin / tfMin))) : 0
 
@@ -389,7 +515,7 @@ var float orbLo = na
 if newDay
     orbHi := na
     orbLo := na
-if inRth and rthBar <= orbBars
+if inRthCoreOnly and rthBar <= orbBars  // OR always RTH 09:30-... even on futures (Globex VWAP is separate)
     orbHi := na(orbHi) ? high : math.max(orbHi, high)
     orbLo := na(orbLo) ? low  : math.min(orbLo, low)
 
@@ -615,9 +741,9 @@ f_dots(int n) =>
 //  Signal gating
 // =============================================================================
 
-sessionOk = not i_rthOnly or inRth
-openOk    = inRth ? rthBar > i_skipOpen : not i_rthOnly
-eodOk     = inRth ? rthBar <= rthTotal - i_skipEOD : not i_rthOnly
+sessionOk = not i_rthOnly or inSession
+openOk    = inSession ? rthBar > i_skipOpen : not i_rthOnly
+eodOk     = inSession ? rthBar <= rthTotal - i_skipEOD : not i_rthOnly
 
 // A pasted blob is one snapshot of today's chain, but the indicator applies it
 // to every bar of loaded history — so every historical signal was scored against
@@ -633,7 +759,7 @@ scopeOk     = not (i_todayOnly and hasGex) or curSession
 // reading that would resolve at 10:00 chops out instead. Raising the bar is
 // cheaper than a hard block: a genuinely strong setup still gets through.
 lunch      = not na(time(timeframe.period, "1130-1400", "America/New_York"))
-effMinConf = minConf + (lunch ? i_lunchBump : 0)
+effMinConf = minConf + (lunch and not isFutures ? i_lunchBump : 0)  // Globex has no lunch lull
 // The score a reversal has to reach to close a trade on FLIP. It tracks the
 // effective gate, so midday noise can't knock a position out on a reading that
 // would not have been allowed to open one.
@@ -738,8 +864,11 @@ blockShort = i_regimeF and posGamma and not na(dSup) and dSup < 0.4
 
 // 0DTE pin: in positive gamma, late session, parked on the control node, price
 // usually stays there. Those entries pay the spread and go nowhere.
-lateSession = inRth and rthBar > rthTotal * 0.6
-pinned = i_pinGuard and posGamma and hasGex and lateSession
+lateSession = (isFutures and not isFuturesForcedEq ? inRthCoreOnly : inRth) and rthBar > rthTotal * 0.6
+// For Globex the 60% mark is ~08:00 next day; the pin risk is really RTH 13:30-16:00, so for futures we also gate on RTH late
+lateSessionIsRthLate = inRthCoreOnly and rthCoreBar > math.round(390.0 / tfMin) * 0.6
+pinnedBase = isFutures and not isFuturesForcedEq ? lateSessionIsRthLate : lateSession
+pinned = i_pinGuard and posGamma and hasGex and (isFutures and not isFuturesForcedEq ? lateSessionIsRthLate : lateSession)
      and not na(cnLvl) and atr > 0 and math.abs(close - cnLvl) < atr * 0.35
 
 var int lastSig = -1000
@@ -1330,7 +1459,7 @@ if i_hud and barstate.islast
     // "3/7" is three separate reasons, which is what the gate is actually about.
     table.cell(t, 0, 1, f_dots(conf10) + "  " + str.tostring(confidence) + "%  " + grade +
          " · " + str.tostring(nAgree) + "/" + str.tostring(nLive) + " families" +
-         (lunch and i_lunchBump > 0 ? "  ·  lunch +" + str.tostring(i_lunchBump) : ""),
+         (lunch and not isFutures and i_lunchBump > 0 ? "  ·  lunch +" + str.tostring(i_lunchBump) : ""),
          text_color = dirCol, bgcolor = color.new(color.black, 85),
          text_size = size.small, text_halign = text.align_left)
 
@@ -1349,16 +1478,20 @@ if i_hud and barstate.islast
          text_color = color.silver, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 
-    // magnet
+    // magnet — for futures also show the point-value notional
     table.cell(t, 0, 4,
          "magnet " + (na(magnet) ? "—" : str.tostring(magnet, format.mintick)) +
          "  " + (magnetPull > 0.05 ? "↑" : magnetPull < -0.05 ? "↓" : "•") +
-         "     rvol " + str.tostring(rvol, "#.#") + "×",
+         "     rvol " + str.tostring(rvol, "#.#") + "×" +
+         (isFutures ? "  ·  $" + str.tostring(pointValue, format.mintick) + "/pt" : ""),
          text_color = c_node, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 
-    // data source — states outright whether real GEX is loaded
-    table.cell(t, 0, 5, hasGex ? "● GEX levels loaded" : "○ auto levels — no GEX blob",
+    // data source — states outright whether real GEX is loaded + futures model
+    table.cell(t, 0, 5,
+         (hasGex ? "● GEX levels loaded" : "○ auto levels — no GEX blob") +
+         (hasGex and isFutures ? "  ·  FUT Black-76  $" + str.tostring(pointValue, format.mintick) + "/pt forward" : "") +
+         (hasGex and not isFutures ? "  ·  EQ Black-Scholes spot" : ""),
          text_color = hasGex ? c_node : color.gray, bgcolor = color.new(color.black, 85),
          text_size = size.tiny, text_halign = text.align_left)
 

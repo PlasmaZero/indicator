@@ -1,14 +1,16 @@
 # GEX Levels + 0DTE Signal Engine
 
 Dealer gamma-exposure levels on the chart, plus a 5-minute buy/sell engine tuned
-for 0DTE and 1DTE trading on SPY, QQQ, IWM, TSLA and NVDA.
+for 0DTE and 1DTE trading — **equities** (SPY, QQQ, IWM, TSLA, NVDA) **and futures**
+(ES, NQ, GC, SI, CL, RTY, YM, ZB …). The futures path re-uses the equity engine
+with the correct pricing model and contract size, so it is not SPY gamma relabelled.
 
 Three pieces:
 
 | Piece | What it does |
 |---|---|
 | `pine/itm_gex_levels.pine` | TradingView indicator — draws the levels, reads the gamma regime, fires signals with targets and alerts |
-| `tools/gex_engine.py` | Turns an options chain into levels and a paste-ready blob for the indicator |
+| `tools/gex_engine.py` | Turns an options chain into levels and a paste-ready blob for the indicator — equities (Black-Scholes on spot, $100) and futures (Black-76 on the forward, CME point values) |
 | `tools/dashboard.py` | Renders the GEX-by-strike panel as a self-contained HTML page |
 
 ---
@@ -45,8 +47,16 @@ side and every read that follows inherits the error.
 ```bash
 cd tools
 pip install yfinance                      # only needed for the live chain
+# Equities — 0DTE
 python3 gex_engine.py --symbols SPY,QQQ,IWM,TSLA,NVDA --dte 0 \
     --json levels.json --html dashboard.html
+
+# Futures — ES / NQ / GC (same flag, correct model & multiplier auto-detected)
+python3 gex_engine.py --symbols ES,NQ,GC --dte 0 \
+    --json futures.json --html futures.html
+
+# Explicit (forces the futures path even if the ticker is non-standard)
+python3 gex_engine.py --symbols ES --model black76 --multiplier 50 --dte 0
 ```
 
 `--dte 0` is the nearest expiry (0DTE), `--dte 1` the next (1DTE).
@@ -65,6 +75,24 @@ Output per symbol:
   Pine blob:
     flip:756.75,cw:760,pw:750,cn:760,cw2:765,pw2:755,cw3:758,pw3:745,cwo:765,pwo:750,em:4.54,ref:757.63,net:346.61
 ```
+
+Futures print the same levels in **forward** terms (the futures price, not the cash index) and with the CME point value:
+
+```
+═══ ES  FUT forward 6000.00  exp 2026-08-05  size oi  [E-mini S&P 500 · $50/pt · black76 · yahoo ES=F] ═══
+  net GEX            5.31 $M / 1%
+  gamma flip       5999.42   (below — positive γ)
+  call wall          6050   (oi wall 6050)
+  put wall           5950   (oi wall 5950)
+  control node       6050
+  expected move ±   66.45  (atm iv 0.150)  [forward]
+  notional EM  ~$3,322 per contract
+
+  Pine blob:
+    flip:5999.42,cw:6050,pw:5950,cn:6050,cwo:6050,pwo:5950,em:66.45,ref:6000,net:5.312,mult:50,mdl:76
+```
+
+`mult` and `mdl` appear only on futures blobs (old Pine versions ignore them). Paste futures blobs onto the **futures** chart (e.g. `CME:ES1!`), not the cash index — levels are futures-price levels.
 
 `ref` is spot at generation — the expected-move band hangs off it, since the
 band is the move *remaining* from that price to the close. `cwo`/`pwo` are the
@@ -380,6 +408,79 @@ an OI wall into `cw2`/`pw2` if you want it drawn too.
 
 ---
 
+## Futures — ES, NQ, GC and the whole CME board
+
+Most “futures gamma” you find online is SPY or SPX equity gamma with the label
+swapped. This engine computes dealer gamma **directly on the futures options
+chain** — priced with **Black-76 on the live forward** and scaled by the real
+CME **point value**, not $100. The numbers are not relabelled equity GEX.
+
+### What is different
+
+| | Equities (SPY, QQQ) | Futures (ES, NQ, GC …) |
+|---|---|---|
+| **Underlying** | Spot / cash index | **Futures forward F** (CME Globex quote, ~23h) |
+| **Options written on** | Spot | **The futures contract itself** (options on futures) |
+| **Pricing model** | Black-Scholes on spot | **Black-76** — `C = e^{-rT}[F N(d1) − K N(d2)]`, `d1 = [ln(F/K)+½σ²T]/σ√T` — which is *exactly* Black-Scholes with `S=F, q=r`. Gamma is `e^{-rT} φ(d1)/(F σ√T)`. At `r=0` the two give the same gamma; at 30 DTE the discount is ~0.4%. |
+| **Gamma** | `φ(d1)/(S σ√T)` | `e^{-rT} φ(d1)/(F σ√T)` — forward gamma |
+| **Dollar GEX** | `Γ × OI × 100 × S² × 1%` | `Γ × OI × (point value) × F² × 1%` |
+| **Point value** | `100` (100 shares) | `ES $50/pt`, `NQ $20/pt`, `RTY $50/pt`, `YM $5/pt`, `GC $100/pt`, `MGC $10/pt`, `SI $5000/pt`, `CL $1000/pt`, `MCL $100/pt`, `NG $10000/pt`, `ZB/ZN/ZT $1000/pt`, `MES $5/pt`, `MNQ $2/pt`, `BTC 5 BTC`, … |
+| **Strikes** | On the spot price | **On the futures price** — ≈ the cash index plus carry/basis. Plot them on the futures chart. |
+| **Session** | 09:30-16:00 RTH | **23h Globex** (18:00-17:00 ET next day, 1h break 17:00-18:00). RTH (09:30-16:00) is still the cash open for OR/VWAP if you want it. |
+| **Expiry cut** | 16:00 ET | Same 16:00 ET cut for the engine (configurable via `--expiry`). CME equity-index weeklies settle the same. |
+| **Expected move** | `spot × IV × √T` (in index points) | `F × IV × √T` (in **futures points**) → `× point value` = dollars per contract. ES 60 pts × $50 = $3k. |
+
+Basis matters: ES futures trade a few points above SPX cash (carry). A flip at 5999 on ES is not a flip at 5999 on SPX. Use the futures chain for futures, the equity chain for equities.
+
+### How to generate futures levels
+
+yfinance carries equity chains directly; **CME futures options are not on yahoo**, so `--source yfinance` will exit with a hint for `ES=F`/`GC=F` etc. Two ways to feed a futures chain:
+
+1. **CME QuikStrike / delayed export** (recommended) → CSV:
+
+```bash
+# Export from CME QuikStrike, Barchart, or your broker as CSV with
+# columns: type,strike,open_interest,implied_volatility[,gamma][,volume]
+python3 gex_engine.py --source csv --csv es_chain.csv --symbols ES --spot 6000 --expiry 2026-08-08
+```
+
+2. **Live chain via yfinance for the few symbols that do carry it** (SPY-proxy ETFs like `SPY`, or if your broker exposes a futures-options ticker that yahoo mirrors) — just pass `--symbols ES` and the engine maps `ES` → `ES=F` automatically.
+
+The engine auto-detects futures from the symbol (`ES`, `NQ`, `GC`, `SI`, `CL`, `NG`, `RTY`, `YM`, `ZB`, `ZN`, `GC=F`, `/ES`, `ES1!` all work) and switches multiplier + model. Override with `--multiplier` / `--model`:
+
+```bash
+python3 gex_engine.py --symbols MYM --multiplier 0.5 --model black76 --dte 0
+python3 gex_engine.py --symbols ES  --model black_scholes --multiplier 100  # force equity treatment on a futures symbol (SPX-proxy)
+```
+
+### Pine indicator — futures mode
+
+Add `pine/itm_gex_levels.pine` to the **futures** chart (`CME:ES1!`, `COMEX:GC1!`, `NYMEX:CL1!`), not the cash index.
+
+A new group **3b · Futures (ES/NQ/GC …)** appears:
+
+* **Instrument** — `Auto` (default) detects futures tickers and switches automatically; force `Futures`/`Equities` to override.
+* **Futures session** — `RTH + ETH (23h, break 17:00-18:00)` follows Globex through the night; `RTH only (09:30-16:00)` mirrors the cash session (useful if you trade cash hours on the futures chart); `ETH only` is the overnight ex-RTH.
+* **VWAP anchor** — `ETH open 18:00` anchors Globex VWAP to the 18:00 open (conventional for futures); `RTH open 09:30` keeps the cash-session VWAP even on the futures chart. `ta.vwap` follows the chart's session, so a CME Globex chart is already ETH-anchored — the toggle only matters if you want the other one.
+* **Point value override** — `0 = auto` uses the CME table; set to force a value for a non-standard contract.
+
+When futures are detected the HUD shows a **FUT · Black-76 · $50/pt forward** badge, the regime line reads `FUT · POSITIVE γ (Black-76 on forward)`, and the magnet line adds the point value. Expected-move bands are still drawn, but the strip also shows the **notional EM** (`±66 pts · ~$3,322 per ES contract`). Lunch-hour confidence bump is automatically disabled on Globex (no lunch lull).
+
+Auto levels (when the blob is empty) also adapt: point of control, VWAP and expected-move still work on any symbol, and the prior-day/overnight levels are shown as `DAY HI/LO` but are calendar-day on futures — set the chart to Globex session for the correct ETH day.
+
+### Dashboard
+
+The dashboard auto-tags futures: a blue **FUT · Black-76 · $50/pt** badge, forward-labelled SPOT tile, notional EM in the strip, and a footnote explaining that these are futures-price levels (paste onto the futures chart). A mixed `SPY,ES,NQ,GC` run renders a tab per symbol with the correct badge per tab.
+
+### Futures vs equities — do not mix
+
+* **Do not paste an ES blob onto a SPX or SPY chart.** The strikes are futures strikes. Basis is a few points on ES, tens of points on GC, and the hedge is in futures, not spot.
+* **Do not paste a SPY blob onto an ES chart** and expect the same flip — it will be a few points low.
+* For **micro contracts** (`MES`, `MNQ`, `MGC`, `MCL`) the levels are the *same* (same strikes, same forward), only the notional per contract scales. The engine's `mult` field tells the dashboard/Pine the dollars per point; the price levels themselves are identical to the standard contract.
+
+
+---
+
 ## The dashboard
 
 `--html dashboard.html` writes a standalone page (no external requests) with the
@@ -499,6 +600,7 @@ used to emit N identical level sets wearing different tickers, which looks like
 real output.
 
 CSV columns: `type,strike,open_interest,implied_volatility[,gamma][,volume]`.
+For futures the `spot` you pass is the **futures forward F** (e.g. 6000 for ES, 2700 for GC) and `gamma` if supplied should be the forward gamma; otherwise the engine computes it with Black-76 on F and the correct point value.
 Supply a `gamma` column and it's used directly instead of being computed; supply
 `volume` and `--oi-mode` can use it.
 
@@ -510,7 +612,7 @@ Supply a `gamma` column and it's used directly instead of being computed; supply
 cd tools && python3 test_gex_engine.py
 ```
 
-69 checks covering the gamma math, sign conventions, level derivation, the
+110+ checks covering the futures Black-76 path (ES/NQ/GC multipliers, forward vs spot, yahoo alias, blob `mult`/`mdl` tags and dashboard FUT badges) plus the gamma math, sign conventions, level derivation, the
 gamma flip through a full session clock, contract sizing, blob round-tripping,
 edge cases, live-server resilience and dashboard rendering. The gamma
 implementation is checked against
@@ -560,7 +662,8 @@ Worth knowing before you risk money on it:
   the alternative is a second bar of lag on every exit.
 - **The engine reads chains, it does not place orders.** No broker integration,
   by design.
+- **Futures basis and contract units matter.** Always plot futures GEX on the futures chart. Micro vs standard (MES vs ES) share price levels but not dollars per point — the engine labels them, the chart does not. Metals/energy/rate contracts have different tick sizes (GC 0.10 = $10/tick, CL 0.01 = $10/tick, SI 0.005 = $25/tick, ZB 1/32) — the Pine indicator uses `syminfo.mintick` so lines land on valid ticks regardless.
 - Expected move uses ATM IV × √T, which understates moves on days with event
-  risk priced into the wings.
+  risk priced into the wings. On futures it is in points — multiply by the point value for dollars per contract (shown in the dashboard and report).
 
 Not financial advice — it's tooling.

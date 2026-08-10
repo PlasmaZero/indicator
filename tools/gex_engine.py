@@ -9,10 +9,18 @@ Computes gamma exposure per strike, locates the call wall, put wall, gamma flip
   * a paste-ready blob for the Pine indicator
   * a self-contained HTML dashboard
 
+Supports both equity index options (SPY, QQQ — Black-Scholes on spot) and
+futures options on the CME (ES, NQ, GC, CL … — Black-76 on the forward) with
+the correct contract multipliers and session handling.
+
 Usage
 -----
     # live chain via yfinance (pip install yfinance)
     python3 gex_engine.py --symbols SPY,QQQ,IWM,TSLA,NVDA --dte 0
+    python3 gex_engine.py --symbols ES,NQ,GC --dte 0
+
+    # force futures treatment or override the point value
+    python3 gex_engine.py --symbols ES --model black76 --multiplier 50
 
     # bring your own chain export
     python3 gex_engine.py --source csv --csv chain.csv --symbol SPY --spot 757.63
@@ -33,18 +41,127 @@ from datetime import datetime, date, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
 # Contract multiplier and the 1% move convention used for dollar gamma.
+# Overridden per-symbol for futures (see FUTURES_SPECS).
 MULTIPLIER = 100
 PCT_MOVE = 0.01
 
-# Expiry cut for US equity options. A fixed UTC offset would be an hour out for
-# the ~4 months a year that are EST, and on a 0DTE afternoon an hour is a large
-# fraction of the remaining T — which flows straight into the expected move.
+# Expiry cut for US options/futures options. A fixed UTC offset would be an hour
+# out for the ~4 months a year that are EST, and on a 0DTE afternoon an hour is a
+# large fraction of the remaining T — which flows straight into the expected move.
 NY = ZoneInfo("America/New_York")
 MIN_T_YEARS = 0.5 / (365.0 * 24.0)  # floor T at 30 minutes so 0DTE gamma stays finite
 
+# Risk-free rate used only for the Black-76 discount (exp(-rT)). At 0DTE it is
+# ~1.0 anyway; the exact value matters only beyond a few weeks. SOFR proxy.
+DEFAULT_R = 0.045
 
 # ---------------------------------------------------------------------------
-# Black-Scholes
+# Futures specs — the three pillars that make futures GEX *not* equity GEX
+# relabelled: (1) the pricing model, (2) the point value / multiplier,
+# (3) the polling symbol.
+# ---------------------------------------------------------------------------
+# Sources: CME spec sheets + Schwab/CME tick-value tables. All tick sizes /
+# multipliers validated against the 2026 CME spec (see dashboard.py for the
+# same table rendered for the user). The *multiplier* here is the dollar
+# value of a 1.00 point move in the futures price — what turns a pure gamma
+# (deltas per point) into dollars. Tick = multiplier × tick_size.
+FUTURES_SPECS: dict[str, dict] = {
+    # Equity indices — the ones the request calls out plus their micros
+    "ES":  {"multiplier": 50,   "tick": 0.25,   "yf": "ES=F",  "name": "E-mini S&P 500",        "exchange": "CME",   "model": "black76"},
+    "NQ":  {"multiplier": 20,   "tick": 0.25,   "yf": "NQ=F",  "name": "E-mini Nasdaq-100",     "exchange": "CME",   "model": "black76"},
+    "YM":  {"multiplier": 5,    "tick": 1.0,    "yf": "YM=F",  "name": "E-mini Dow ($5)",       "exchange": "CBOT",  "model": "black76"},
+    "RTY": {"multiplier": 50,   "tick": 0.10,   "yf": "RTY=F", "name": "E-mini Russell 2000",   "exchange": "CME",   "model": "black76"},
+    "MES": {"multiplier": 5,    "tick": 0.25,   "yf": "MES=F", "name": "Micro E-mini S&P 500",  "exchange": "CME",   "model": "black76"},
+    "MNQ": {"multiplier": 2,    "tick": 0.25,   "yf": "MNQ=F", "name": "Micro E-mini Nasdaq",   "exchange": "CME",   "model": "black76"},
+    "MYM": {"multiplier": 0.5,  "tick": 1.0,    "yf": "MYM=F", "name": "Micro E-mini Dow",      "exchange": "CBOT",  "model": "black76"},
+    "M2K": {"multiplier": 5,    "tick": 0.10,   "yf": "M2K=F", "name": "Micro E-mini Russell",  "exchange": "CME",   "model": "black76"},
+    # Metals — GC the headliner the user asked for
+    "GC":  {"multiplier": 100,  "tick": 0.10,   "yf": "GC=F",  "name": "Gold",                  "exchange": "COMEX", "model": "black76"},
+    "MGC": {"multiplier": 10,   "tick": 0.10,   "yf": "MGC=F", "name": "Micro Gold",            "exchange": "COMEX", "model": "black76"},
+    "SI":  {"multiplier": 5000, "tick": 0.005,  "yf": "SI=F",  "name": "Silver",                "exchange": "COMEX", "model": "black76"},
+    "HG":  {"multiplier": 25000,"tick": 0.0005, "yf": "HG=F",  "name": "Copper",                "exchange": "COMEX", "model": "black76"},
+    "PL":  {"multiplier": 50,   "tick": 0.10,   "yf": "PL=F",  "name": "Platinum",              "exchange": "NYMEX", "model": "black76"},
+    # Energy
+    "CL":  {"multiplier": 1000, "tick": 0.01,   "yf": "CL=F",  "name": "WTI Crude Oil",         "exchange": "NYMEX", "model": "black76"},
+    "MCL": {"multiplier": 100,  "tick": 0.01,   "yf": "MCL=F", "name": "Micro WTI Crude",       "exchange": "NYMEX", "model": "black76"},
+    "NG":  {"multiplier": 10000,"tick": 0.001,  "yf": "NG=F",  "name": "Natural Gas",           "exchange": "NYMEX", "model": "black76"},
+    "HO":  {"multiplier": 42000,"tick": 0.0001, "yf": "HO=F",  "name": "Heating Oil",           "exchange": "NYMEX", "model": "black76"},
+    "RB":  {"multiplier": 42000,"tick": 0.0001, "yf": "RB=F",  "name": "RBOB Gasoline",         "exchange": "NYMEX", "model": "black76"},
+    # Rates
+    "ZB":  {"multiplier": 1000, "tick": 0.03125, "yf": "ZB=F", "name": "30Y T-Bond",             "exchange": "CBOT",  "model": "black76"},
+    "ZN":  {"multiplier": 1000, "tick": 0.015625,"yf": "ZN=F", "name": "10Y T-Note",            "exchange": "CBOT",  "model": "black76"},
+    "ZT":  {"multiplier": 1000, "tick": 0.0078125,"yf":"ZT=F", "name": "2Y T-Note",             "exchange": "CBOT",  "model": "black76"},
+    # FX (quoted differently but still Black-76 on the forward)
+    "6E":  {"multiplier": 125000,"tick": 0.00005, "yf": "6E=F","name": "Euro FX",               "exchange": "CME",   "model": "black76"},
+    "6B":  {"multiplier": 62500, "tick": 0.0001,  "yf": "6B=F","name": "British Pound",         "exchange": "CME",   "model": "black76"},
+    "6J":  {"multiplier": 12500000,"tick":0.0000005,"yf":"6J=F","name":"Japanese Yen",         "exchange": "CME",   "model": "black76"},
+    # Crypto (CME)
+    "BTC": {"multiplier": 5,    "tick": 5,      "yf": "BTC-USD","name": "Bitcoin (CME 5 BTC)","exchange": "CME",   "model": "black76"},
+    "ETH": {"multiplier": 50,   "tick": 0.5,    "yf": "ETH-USD","name": "Ether (CME 50 ETH)",  "exchange": "CME",   "model": "black76"},
+    # Volatility
+    "VIX": {"multiplier": 1000, "tick": 0.05,   "yf": "^VIX", "name": "VIX",                   "exchange": "CBOE",  "model": "black_scholes"},
+}
+
+
+def _normalize_symbol(sym: str) -> str:
+    """Strip common suffixes so 'ES=F', '/ES', 'ES1!' all resolve to 'ES'."""
+    s = sym.strip().upper()
+    # strip leading slash used by some platforms (/ES)
+    if s.startswith("/"):
+        s = s[1:]
+    # strip yahoo suffixes
+    if s.endswith("=F"):
+        s = s[:-2]
+    # strip TradingView continuous markers: ES1!, ES2!, NQ1! etc
+    if s.endswith("!"):
+        s = s[:-1]
+        # remove trailing digit left after stripping !
+        while s and s[-1].isdigit():
+            s = s[:-1]
+    # CME micro shorthands may be MES1! style — already handled
+    # handle -USD crypto
+    if s.endswith("-USD"):
+        s = s[:-4]
+    # handle ^VIX style
+    if s.startswith("^"):
+        s = s[1:]
+    return s
+
+
+def futures_spec(symbol: str) -> dict | None:
+    return FUTURES_SPECS.get(_normalize_symbol(symbol))
+
+
+def is_futures(symbol: str) -> bool:
+    return futures_spec(symbol) is not None
+
+
+def yf_symbol_for(symbol: str) -> str:
+    spec = futures_spec(symbol)
+    if spec:
+        return spec["yf"]
+    # Equities: pass through as-is; already a valid yahoo ticker
+    return symbol
+
+
+def multiplier_for(symbol: str, override: float | None = None) -> float:
+    if override is not None:
+        return float(override)
+    spec = futures_spec(symbol)
+    return float(spec["multiplier"]) if spec else float(MULTIPLIER)
+
+
+def model_for(symbol: str, override: str | None = None) -> str:
+    if override and override != "auto":
+        return override
+    spec = futures_spec(symbol)
+    if spec:
+        return spec["model"]
+    return "black_scholes"
+
+
+# ---------------------------------------------------------------------------
+# Black-Scholes / Black-76
 # ---------------------------------------------------------------------------
 def norm_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
@@ -57,6 +174,49 @@ def bs_gamma(S: float, K: float, T: float, sigma: float, r: float = 0.0, q: floa
     vol_t = sigma * math.sqrt(T)
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / vol_t
     return math.exp(-q * T) * norm_pdf(d1) / (S * vol_t)
+
+
+def black76_gamma(F: float, K: float, T: float, sigma: float, r: float = DEFAULT_R) -> float:
+    """
+    Black-76 gamma — options on futures/forwards.
+
+    For a European option on a forward F (futures price), with strike K,
+    time T, vol sigma, risk-free r:
+
+        C = e^{-rT} [ F N(d1) - K N(d2) ]
+        d1 = [ln(F/K) + 0.5 sigma² T] / (sigma sqrt(T))
+
+        gamma_F = e^{-rT} * φ(d1) / (F sigma sqrt(T))
+
+    This is exactly Black-Scholes with S=F, q=r — the clean substitution
+    noted by Black (1976). The discounted delta is e^{-rT} N(d1); its
+    derivative w.r.t. F is the discounted gamma above. Some desks quote
+    *undiscounted* gamma (drop the e^{-rT}); at 0DTE the factor is 0.9999 and
+    the difference is immaterial, but we keep it for correctness beyond a week.
+
+    For very short T the discount is negligible; passing r=0 recovers the
+    undiscounted form.
+    """
+    if F <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return 0.0
+    vol_t = sigma * math.sqrt(T)
+    d1 = (math.log(F / K) + 0.5 * sigma * sigma * T) / vol_t
+    return math.exp(-r * T) * norm_pdf(d1) / (F * vol_t)
+
+
+def gamma_for(
+    S_or_F: float,
+    K: float,
+    T: float,
+    sigma: float,
+    model: str = "black_scholes",
+    r: float = DEFAULT_R,
+    q: float = 0.0,
+) -> float:
+    """Dispatch to the correct gamma model."""
+    if model == "black76":
+        return black76_gamma(S_or_F, K, T, sigma, r)
+    return bs_gamma(S_or_F, K, T, sigma, r, q)
 
 
 def year_fraction(expiry: date, now: datetime | None = None) -> float:
@@ -132,48 +292,87 @@ class Levels:
     put_wall_oi: float | None = None
     size_mode: str = "oi"
     profile: list[tuple[float, float]] = field(default_factory=list)
+    # Futures-aware extras — keep JSON backward-compatible (old readers ignore them)
+    multiplier: float = 100
+    model: str = "black_scholes"
+    is_futures: bool = False
+    underlying_label: str = "spot"
+    point_value: float = 100  # alias for multiplier in display
 
 
 # ---------------------------------------------------------------------------
 # GEX math
 # ---------------------------------------------------------------------------
-def strike_gex(c: Contract, S: float, T: float) -> float:
+def strike_gex(
+    c: Contract,
+    S: float,
+    T: float,
+    multiplier: float = MULTIPLIER,
+    model: str = "black_scholes",
+    r: float = 0.0,
+) -> float:
     """
     Dollar gamma exposure for one strike, in dollars per 1% move.
 
     Sign convention: dealers are assumed long calls / short puts against
     customer flow, so calls contribute positive gamma and puts negative.
+
+    For futures, `S` is the futures forward F, `model` should be ``black76``
+    and `multiplier` is the CME point value ($50 for ES, $20 for NQ, $100 for
+    GC …). For equities it is $100 × underlying.
     """
-    g = c.gamma if c.gamma is not None else bs_gamma(S, c.strike, T, c.iv)
-    notional = g * c.open_interest * MULTIPLIER * S * S * PCT_MOVE
+    g = c.gamma if c.gamma is not None else gamma_for(S, c.strike, T, c.iv, model, r)
+    notional = g * c.open_interest * multiplier * S * S * PCT_MOVE
     return notional if c.kind == "call" else -notional
 
 
-def build_profile(contracts: list[Contract], S: float, T: float) -> dict[float, float]:
+def build_profile(
+    contracts: list[Contract],
+    S: float,
+    T: float,
+    multiplier: float = MULTIPLIER,
+    model: str = "black_scholes",
+    r: float = 0.0,
+) -> dict[float, float]:
     prof: dict[float, float] = {}
     for c in contracts:
         if c.open_interest <= 0:
             continue
-        prof[c.strike] = prof.get(c.strike, 0.0) + strike_gex(c, S, T)
+        prof[c.strike] = prof.get(c.strike, 0.0) + strike_gex(c, S, T, multiplier, model, r)
     return prof
 
 
-def total_gex_at(contracts: list[Contract], spot: float, T: float) -> float:
-    """Total GEX if spot were `spot`, re-evaluating every gamma at that level."""
+def total_gex_at(
+    contracts: list[Contract],
+    spot: float,
+    T: float,
+    multiplier: float = MULTIPLIER,
+    model: str = "black_scholes",
+    r: float = 0.0,
+) -> float:
+    """Total GEX if spot/forward were `spot`, re-evaluating every gamma at that level."""
     total = 0.0
     for c in contracts:
         if c.open_interest <= 0 or c.iv <= 0:
             continue
-        g = bs_gamma(spot, c.strike, T, c.iv)
-        notional = g * c.open_interest * MULTIPLIER * spot * spot * PCT_MOVE
+        g = gamma_for(spot, c.strike, T, c.iv, model, r)
+        notional = g * c.open_interest * multiplier * spot * spot * PCT_MOVE
         total += notional if c.kind == "call" else -notional
     return total
 
 
-def _scan_flip(contracts: list[Contract], S: float, T: float,
-               width: float, steps: int) -> tuple[float | None, int]:
+def _scan_flip(
+    contracts: list[Contract],
+    S: float,
+    T: float,
+    width: float,
+    steps: int,
+    multiplier: float = MULTIPLIER,
+    model: str = "black_scholes",
+    r: float = 0.0,
+) -> tuple[float | None, int]:
     """
-    One pass of the zero-gamma scan over ±`width` around spot.
+    One pass of the zero-gamma scan over ±`width` around spot/forward.
 
     Returns the sign crossing nearest spot and how many grid points carried any
     information. Points where aggregate gamma is *exactly* zero are dropped
@@ -182,12 +381,11 @@ def _scan_flip(contracts: list[Contract], S: float, T: float,
     means "no evidence here", not "the flip is here".
     """
     lo, hi = S * (1 - width), S * (1 + width)
-    step = (hi - lo) / steps
     xs: list[float] = []
     ys: list[float] = []
     for i in range(steps + 1):
-        x = lo + i * step
-        y = total_gex_at(contracts, x, T)
+        x = lo + i * (hi - lo) / steps
+        y = total_gex_at(contracts, x, T, multiplier, model, r)
         if y != 0.0:
             xs.append(x)
             ys.append(y)
@@ -206,10 +404,18 @@ def _scan_flip(contracts: list[Contract], S: float, T: float,
     return best, len(xs)
 
 
-def find_gamma_flip(contracts: list[Contract], S: float, T: float,
-                    span: float = 0.10, steps: int = 240) -> float | None:
+def find_gamma_flip(
+    contracts: list[Contract],
+    S: float,
+    T: float,
+    span: float = 0.10,
+    steps: int = 240,
+    multiplier: float = MULTIPLIER,
+    model: str = "black_scholes",
+    r: float = 0.0,
+) -> float | None:
     """
-    Zero-gamma level: the spot at which aggregate dealer gamma changes sign.
+    Zero-gamma level: the spot/forward at which aggregate dealer gamma changes sign.
 
     Scans a grid around spot and linearly interpolates the crossing, which is
     more faithful than summing GEX cumulatively across strikes because gamma
@@ -225,7 +431,7 @@ def find_gamma_flip(contracts: list[Contract], S: float, T: float,
     """
     width = span
     for _ in range(8):
-        best, live = _scan_flip(contracts, S, T, width, steps)
+        best, live = _scan_flip(contracts, S, T, width, steps, multiplier, model, r)
         if best is not None:
             return best
         # A grid that was well populated and still found no crossing has given a
@@ -245,13 +451,49 @@ def resolve_size_mode(mode: str, expiry: date, now: datetime | None = None) -> s
     return "max" if expiry <= today else "oi"
 
 
-def derive_levels(symbol: str, expiry: date, contracts: list[Contract], S: float,
-                  size_mode: str = "oi", now: datetime | None = None) -> Levels:
+def derive_levels(
+    symbol: str,
+    expiry: date,
+    contracts: list[Contract],
+    S: float,
+    size_mode: str = "oi",
+    now: datetime | None = None,
+    multiplier: float | None = None,
+    model: str | None = None,
+    r: float = DEFAULT_R,
+) -> Levels:
     T = year_fraction(expiry, now)
     mode = resolve_size_mode(size_mode, expiry, now)
     contracts = apply_size_mode(contracts, mode)
-    prof = build_profile(contracts, S, T)
-    lv = Levels(symbol=symbol, spot=S, expiry=expiry.isoformat(), size_mode=mode)
+
+    # Futures auto-detection — the three things that must travel together:
+    # multiplier, pricing model, and the label the dashboard/Pine show.
+    spec = futures_spec(symbol)
+    fut = spec is not None
+    mult = multiplier_for(symbol, multiplier)
+    mdl = model_for(symbol, model)
+
+    # Allow explicit model override to flip `fut` flag if the caller insists.
+    # e.g., --model black_scholes on ES forces equity treatment even though ES
+    # is known to be a future. Rarely needed, but keeps the API orthogonal.
+    if model is not None and model != "auto":
+        mdl = model
+        fut = (mdl == "black76")
+
+    r_eff = r if mdl == "black76" else 0.0
+    prof = build_profile(contracts, S, T, mult, mdl, r_eff)
+    label = "forward" if fut else "spot"
+    lv = Levels(
+        symbol=symbol,
+        spot=S,
+        expiry=expiry.isoformat(),
+        size_mode=mode,
+        multiplier=mult,
+        model=mdl,
+        is_futures=fut,
+        underlying_label=label,
+        point_value=mult,
+    )
 
     if not prof:
         return lv
@@ -262,7 +504,7 @@ def derive_levels(symbol: str, expiry: date, contracts: list[Contract], S: float
     calls_above = {k: v for k, v in prof.items() if v > 0 and k >= S}
     puts_below = {k: v for k, v in prof.items() if v < 0 and k <= S}
 
-    # Walls: largest positive GEX above spot, most negative below.
+    # Walls: largest positive GEX above spot/forward, most negative below.
     if calls_above:
         ranked = sorted(calls_above.items(), key=lambda kv: kv[1], reverse=True)
         lv.call_wall = ranked[0][0]
@@ -291,9 +533,10 @@ def derive_levels(symbol: str, expiry: date, contracts: list[Contract], S: float
     if put_oi:
         lv.put_wall_oi = max(put_oi.items(), key=lambda kv: kv[1])[0]
 
-    lv.gamma_flip = find_gamma_flip(contracts, S, T)
+    lv.gamma_flip = find_gamma_flip(contracts, S, T, multiplier=mult, model=mdl, r=r_eff)
 
-    # ATM IV drives the expected move for the session.
+    # ATM IV drives the expected move for the session. For futures the same
+    # formula applies with F in place of S (the move is in futures points).
     atm = min(contracts, key=lambda c: abs(c.strike - S), default=None)
     if atm is not None and atm.iv > 0:
         band = [c.iv for c in contracts if abs(c.strike - S) <= max(S * 0.005, 0.01) and c.iv > 0]
@@ -312,9 +555,19 @@ def load_yfinance(symbol: str, dte: int) -> tuple[list[Contract], float, date]:
     except ImportError:
         sys.exit("yfinance not installed. Run: pip install yfinance")
 
-    tk = yf.Ticker(symbol)
+    yf_sym = yf_symbol_for(symbol)
+    tk = yf.Ticker(yf_sym)
     expiries = tk.options
     if not expiries:
+        # Helpful hint for futures: not every yahoo ticker carries an options chain.
+        # ES=F options are not on yahoo; the user should fall back to --source csv
+        # with a CME export (e.g., from CME QuikStrike or delayed chain).
+        if is_futures(symbol):
+            sys.exit(
+                f"No expirations returned for {symbol} (yahoo ticker {yf_sym}). "
+                f"CME futures options are not on yahoo — export the chain from "
+                f"CME QuikStrike / delayed quotes and pass --source csv --symbol {symbol} --spot <F> --expiry YYYY-MM-DD"
+            )
         sys.exit(f"No expirations returned for {symbol}")
 
     # Options expire on the New York calendar, not the calendar of whatever
@@ -333,7 +586,7 @@ def load_yfinance(symbol: str, dte: int) -> tuple[list[Contract], float, date]:
 
     hist = tk.history(period="1d", interval="1m")
     if hist.empty:
-        sys.exit(f"No price data for {symbol}")
+        sys.exit(f"No price data for {symbol} (yahoo {yf_sym})")
     spot = float(hist["Close"].iloc[-1])
 
     chain = tk.option_chain(expiry_str)
@@ -389,15 +642,21 @@ def pine_blob(lv: Levels) -> str:
         ("cwo", lv.call_wall_oi),
         ("pwo", lv.put_wall_oi),
         ("em", lv.expected_move),
-        # Spot at generation. The expected move is the move *remaining* from
-        # here to the close, so the band has to hang off this price — anchoring
-        # it to the session open instead makes a midday regeneration draw a
-        # half-day band around a full-day starting point.
+        # Spot/forward at generation. The expected move is the move *remaining*
+        # from here to the close, so the band has to hang off this price —
+        # anchoring it to the session open instead makes a midday regeneration
+        # draw a half-day band around a full-day starting point.
         ("ref", lv.spot),
     ]
     body = ",".join(f"{k}:{fmt(v)}" for k, v in parts if v is not None)
     if lv.net_gex:
         body += f",net:{fmt(lv.net_gex / 1e6, 3)}"
+    # Futures hint — Pine can display the correct tick/value if it knows.
+    # Old Pine versions ignore unknown keys, so this is backward-compatible.
+    if lv.is_futures:
+        body += f",mult:{fmt(lv.multiplier, 2)}"
+        # short model tag for debugging: 76 = Black-76, S = Black-Scholes
+        body += f",mdl:{'76' if lv.model=='black76' else 'S'}"
     return body
 
 
@@ -408,17 +667,28 @@ def pine_profile(lv: Levels, top: int = 24) -> str:
 
 
 def print_report(lv: Levels) -> None:
-    print(f"\n═══ {lv.symbol}  spot {lv.spot:.2f}  exp {lv.expiry}  size {lv.size_mode} ═══")
+    tag = "FUT" if lv.is_futures else "EQ "
+    yf = yf_symbol_for(lv.symbol) if lv.is_futures else lv.symbol
+    extra = ""
+    if lv.is_futures:
+        spec = futures_spec(lv.symbol)
+        nm = spec["name"] if spec else "Futures"
+        extra = f"  [{nm} · ${lv.multiplier:g}/pt · {lv.model} · yahoo {yf}]"
+    print(f"\n═══ {lv.symbol}  {tag} {lv.underlying_label} {lv.spot:.2f}  exp {lv.expiry}  size {lv.size_mode}{extra} ═══")
     print(f"  net GEX      {lv.net_gex / 1e6:>10.2f} $M / 1%")
     if lv.gamma_flip is None:
         print("  gamma flip          —   (no sign change in the chain — regime unknown)")
     else:
         print(f"  gamma flip   {fmt(lv.gamma_flip):>10}   "
-              f"({'above spot — negative γ' if lv.gamma_flip > lv.spot else 'below spot — positive γ'})")
+              f"({'above — negative γ' if lv.gamma_flip > lv.spot else 'below — positive γ'})")
     print(f"  call wall    {fmt(lv.call_wall):>10}   (oi wall {fmt(lv.call_wall_oi)})")
     print(f"  put wall     {fmt(lv.put_wall):>10}   (oi wall {fmt(lv.put_wall_oi)})")
     print(f"  control node {fmt(lv.control_node):>10}")
-    print(f"  expected move ±{fmt(lv.expected_move):>8}  (atm iv {fmt(lv.atm_iv, 4)})")
+    print(f"  expected move ±{fmt(lv.expected_move):>8}  (atm iv {fmt(lv.atm_iv, 4)})  [{lv.underlying_label}]")
+    if lv.is_futures:
+        # Dollar-terms check — ES 20 pts ≈ $1000, GC $15 ≈ $1500, etc.
+        if lv.expected_move:
+            print(f"  notional EM  ~${abs(lv.expected_move * lv.multiplier):,.0f} per contract")
     print(f"\n  Pine blob:\n    {pine_blob(lv)}")
     print(f"\n  Pine profile:\n    {pine_profile(lv)}")
 
@@ -427,7 +697,8 @@ def print_report(lv: Levels) -> None:
 # Live server
 # ---------------------------------------------------------------------------
 def run_server(symbols: list[str], dte: int, port: int, interval: int,
-               size_mode: str = "oi") -> None:
+               size_mode: str = "oi", multiplier: float | None = None,
+               model: str | None = None, r: float = DEFAULT_R) -> None:
     """
     Serve a self-refreshing dashboard. A background thread re-pulls the chains
     on `interval`; the page polls /api/levels and repaints without a reload, so
@@ -455,7 +726,8 @@ def run_server(symbols: list[str], dte: int, port: int, interval: int,
             for sym in symbols:
                 try:
                     contracts, spot, expiry = load_yfinance(sym, dte)
-                    cache[sym] = derive_levels(sym, expiry, contracts, spot, size_mode)
+                    cache[sym] = derive_levels(sym, expiry, contracts, spot, size_mode,
+                                               multiplier=multiplier, model=model, r=r)
                 except Exception as exc:                  # keep serving stale data
                     errors.append(f"{sym}: {exc}")
             state["levels"] = [cache[s] for s in symbols if s in cache]
@@ -515,11 +787,11 @@ def run_server(symbols: list[str], dte: int, port: int, interval: int,
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--symbols", default="SPY", help="comma separated tickers")
+    ap.add_argument("--symbols", default="SPY", help="comma separated tickers — equities (SPY, QQQ) and futures (ES, NQ, GC, CL) both accepted")
     ap.add_argument("--dte", type=int, default=0, help="0 = nearest expiry, 1 = next, ...")
     ap.add_argument("--source", choices=["yfinance", "csv"], default="yfinance")
     ap.add_argument("--csv", help="chain export when --source csv")
-    ap.add_argument("--spot", type=float, help="spot price when --source csv")
+    ap.add_argument("--spot", type=float, help="spot/forward price when --source csv (for futures this is the futures price F)")
     ap.add_argument("--expiry", help="YYYY-MM-DD when --source csv")
     ap.add_argument("--json", help="write levels JSON here")
     ap.add_argument("--html", help="write dashboard HTML here")
@@ -532,14 +804,24 @@ def main() -> None:
                     help="how to size each contract: oi (published, one day stale), "
                          "volume (today only), max/sum of the two, or auto — max on a "
                          "0DTE chain where open interest predates the session, oi otherwise")
+    ap.add_argument("--multiplier", type=float, default=None,
+                    help="override the contract point value ($/point). For equities default is 100; "
+                         "for ES it is 50, NQ 20, GC 100, SI 5000, CL 1000, etc. Auto-detected when omitted.")
+    ap.add_argument("--model", choices=["auto", "black_scholes", "black76"], default="auto",
+                    help="pricing model for gamma. 'auto' uses Black-76 for futures (ES/NQ/GC/...) and "
+                         "Black-Scholes for equities. Override to force one or the other.")
+    ap.add_argument("--risk-free", type=float, default=DEFAULT_R,
+                    help="risk-free rate for Black-76 discount (default 0.045). Ignored for Black-Scholes.")
     args = ap.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    model_arg = None if args.model == "auto" else args.model
 
     if args.serve:
         if args.source == "csv":
             sys.exit("--serve needs a live source; drop --source csv")
-        run_server(symbols, args.dte, args.port, max(15, args.interval), args.oi_mode)
+        run_server(symbols, args.dte, args.port, max(15, args.interval), args.oi_mode,
+                   multiplier=args.multiplier, model=model_arg, r=args.risk_free)
         return
 
     results: list[Levels] = []
@@ -558,7 +840,8 @@ def main() -> None:
         else:
             contracts, spot, expiry = load_yfinance(sym, args.dte)
 
-        lv = derive_levels(sym, expiry, contracts, spot, args.oi_mode)
+        lv = derive_levels(sym, expiry, contracts, spot, args.oi_mode,
+                           multiplier=args.multiplier, model=model_arg, r=args.risk_free)
         results.append(lv)
         print_report(lv)
 
